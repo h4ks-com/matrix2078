@@ -27,14 +27,21 @@ matrix2051 had five fatal flaws, all fixed here by design:
 
 ## Status
 
-M0 + M1 done: minimal IRCd, persistent Matrix sessions, **all joined rooms
+M0–M2 done: minimal IRCd, persistent Matrix sessions, **all joined rooms
 bridged automatically** (matrix2051-style), stable per-room channel names
 (room renames surface as TOPIC, never as channel renames), room version 12
 works, authenticated media pipeline (images/files are downloaded with the
-access token, cached locally and served at stable
+access token, cached locally and served at stable signed
 `http://127.0.0.1:2079/...` URLs), and capped NAMES/WHO replies so
-thousand-member rooms don't freeze IRC clients. See `AGENTS.md` for the
-milestone plan up to M6 (goguma/voidbar compat passes).
+thousand-member rooms don't freeze IRC clients.
+
+M2 adds IRCv3: capability negotiation, **SASL PLAIN** (user = full
+`@user:domain`, password = Matrix password), **server-time** + `msgid` tags
+(event ids, used as chathistory anchors), **echo-message**, **draft/multiline**
+batches both ways (with word-wrap downgrade for legacy clients),
+**draft/chathistory** (LATEST/BEFORE/AFTER/BETWEEN/TARGETS via Matrix
+`/messages` + `/context`), away-notify via Matrix presence. See `AGENTS.md`
+for the milestone plan up to M6 (goguma/voidbar compat passes).
 
 ## Usage
 
@@ -44,8 +51,10 @@ cargo run --release -- --allow-register
 
 Then connect an IRC client to `127.0.0.1:2078`:
 
-- **server password**: your Matrix account password
+- **server password** (or SASL PLAIN): your Matrix account password
 - **nick**: your Matrix localpart (e.g. `m2078` for `@m2078:example.org`)
+- **SASL username**: full `@user:domain` mxid (recommended; also used for
+  the first login)
 - **username** (optional): full `@user:domain` for the first login
 - **realname** (GECOS): your homeserver URL, matrix2051-style (optional if
   configured in `matrix2078.toml`)

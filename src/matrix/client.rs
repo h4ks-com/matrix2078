@@ -44,6 +44,23 @@ async fn build_client(homeserver: &str, sqlite_dir: &Path) -> Result<Client> {
 /// `login_user` is the Matrix user id (or localpart) used for a fresh login:
 /// taken from the USER field when it looks like an mxid, else the nick.
 /// `hs_override` (GECOS/config/env) wins over the stored homeserver.
+/// State key for a login: mxid localpart when `login_user` is a full mxid
+/// (keeps SASL `@user:domain` and nick-based logins on the same session),
+/// else the nick.
+pub fn state_key(nick: &str, login_user: &str) -> String {
+    login_user
+        .trim_start_matches('@')
+        .split_once(':')
+        .map(|(local, _)| local.to_owned())
+        .unwrap_or_else(|| nick.to_owned())
+}
+
+/// Restore a stored session for `nick`, or log in with the IRC password and
+/// persist the new session (only when registration is allowed).
+///
+/// `login_user` is the Matrix user id (or localpart) used for a fresh login:
+/// taken from the USER field when it looks like an mxid, else the nick.
+/// `hs_override` (GECOS/config/env) wins over the stored homeserver.
 pub async fn login_or_restore(
     cfg: &Config,
     nick: &str,
@@ -51,7 +68,7 @@ pub async fn login_or_restore(
     login_user: &str,
     hs_override: Option<&str>,
 ) -> Result<Client> {
-    let dir = user_dir(&cfg.state_dir, nick);
+    let dir = user_dir(&cfg.state_dir, &state_key(nick, login_user));
     let sqlite_dir = dir.join("sqlite");
 
     if super::session::session_path(&dir).exists() {

@@ -1,20 +1,30 @@
-//! Minimal IRC server: TCP listener, registration, core commands,
-//! and the Matrix-backed relay loop.
+//! IRC server: TCP listener, registration (PASS/NICK/USER/CAP/SASL),
+//! core commands, IRCv3 extensions (server-time, echo-message, multiline,
+//! chathistory) and the Matrix-backed relay loop.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
 use irc::proto::{CapSubCommand, Command, IrcCodec, Message, Prefix, Response};
+use irc::proto::message::Tag;
 use tokio::{net::{TcpListener, TcpStream}, sync::mpsc};
 use tokio_util::codec::Framed;
 
 use crate::{
-    bridge::Bridge,
+    bridge::{Bridge, history::{self, HistoryItem}},
     config::Config,
     ircd::{
-        proto::{client_prefix, from_client, num, srv},
-        session::{Registration, valid_nick},
+        caps::{self, Caps},
+        proto::{self, client_prefix, from_client, num, srv},
+        session::{Registration, decode_sasl_plain, valid_nick},
     },
     media::MediaServer,
 };
@@ -83,26 +93,12 @@ async fn handle_conn(
                 reg.user = Some(u);
                 reg.realname = Some(r);
             }
-            Command::CAP(_, sub, caps, _) => match sub {
-                CapSubCommand::LS => {
-                    reg.cap_started = true;
-                    framed
-                        .send(srv(&server, Command::CAP(Some("*".into()), CapSubCommand::LS, Some(String::new()), None)))
-                        .await?;
-                }
-                CapSubCommand::LIST => {
-                    framed
-                        .send(srv(&server, Command::CAP(Some("*".into()), CapSubCommand::LIST, Some(String::new()), None)))
-                        .await?;
-                }
-                CapSubCommand::REQ => {
-                    framed
-                        .send(srv(&server, Command::CAP(Some("*".into()), CapSubCommand::NAK, caps, None)))
-                        .await?;
-                }
-                CapSubCommand::END => reg.cap_ended = true,
-                _ => {}
-            },
+            Command::CAP(_, sub, caps_req, _) => {
+                handle_cap(&mut framed, &server, &mut reg, sub, caps_req.as_deref()).await?;
+            }
+            Command::AUTHENTICATE(arg) => {
+                handle_authenticate(&mut framed, &server, &mut reg, &arg).await?;
+            }
             Command::QUIT(reason) => {
                 send_quit(&mut framed, &server, reason).await?;
                 return Ok(());
@@ -118,12 +114,18 @@ async fn handle_conn(
     };
 
     // ---------------- post-registration ----------------
+    let caps = reg.caps.clone();
     let mut nick = reg.nick.clone().unwrap_or_default();
     let username = irc_username(reg.user.as_deref().unwrap_or("u"));
     let prefix = client_prefix(&nick, &username);
 
     for m in welcome_burst(&server, &nick) {
-        framed.send(m).await?;
+        send_out(&mut framed, &caps, m).await?;
+    }
+    if reg.sasl_user.is_some() {
+        // account-notify base: announce our own account once
+        let account = reg.sasl_user.clone().unwrap_or_default();
+        let _ = account;
     }
 
     // JOIN every mapped room's channel before any PRIVMSG can reference it
@@ -134,16 +136,129 @@ async fn handle_conn(
     }
 
     let (tx, mut rx) = mpsc::channel::<Message>(256);
-    bridge.relay_matrix_to_irc(tx);
+    bridge.relay_matrix_to_irc(tx.clone());
     let sync_task = bridge.spawn_sync();
 
     let result =
-        relay_loop(&mut framed, &peer, &server, &prefix, &mut nick, &username, &bridge, &mut rx)
+        relay_loop(&mut framed, &peer, &server, &prefix, &mut nick, &username, &bridge, &caps, &mut rx, tx)
             .await;
     // the matrix sync loop must not outlive the IRC connection: it holds the
     // device's sync position and would block the next session of this user
     sync_task.abort();
     result
+}
+
+/// CAP negotiation during registration.
+async fn handle_cap(
+    framed: &mut Framed<TcpStream, IrcCodec>,
+    server: &str,
+    reg: &mut Registration,
+    sub: CapSubCommand,
+    caps_req: Option<&str>,
+) -> Result<()> {
+    use CapSubCommand::*;
+    match sub {
+        LS => {
+            reg.cap_started = true;
+            framed
+                .send(srv(server, Command::CAP(Some("*".into()), LS, Some(caps::Caps::ls()), None)))
+                .await?;
+        }
+        LIST => {
+            framed
+                .send(srv(server, Command::CAP(Some("*".into()), LIST, Some(reg.caps.list()), None)))
+                .await?;
+        }
+        REQ => {
+            let req = caps_req.unwrap_or("");
+            match reg.caps.apply_req(req) {
+                Ok(_) => {
+                    framed
+                        .send(srv(server, Command::CAP(Some("*".into()), ACK, Some(req.to_owned()), None)))
+                        .await?;
+                }
+                Err(_) => {
+                    framed
+                        .send(srv(server, Command::CAP(Some("*".into()), NAK, Some(req.to_owned()), None)))
+                        .await?;
+                }
+            }
+            reg.cap_started = true;
+        }
+        END => reg.cap_ended = true,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// SASL PLAIN during registration: `AUTHENTICATE PLAIN` then the base64 payload.
+async fn handle_authenticate(
+    framed: &mut Framed<TcpStream, IrcCodec>,
+    server: &str,
+    reg: &mut Registration,
+    arg: &str,
+) -> Result<()> {
+    let nick = reg.nick.clone().unwrap_or_else(|| "*".to_owned());
+    if arg == "*" {
+        reg.sasl_pending = false;
+        framed
+            .send(num(server, Response::ERR_SASLABORT, &nick, vec![
+                "SASL authentication aborted".to_owned(),
+            ]))
+            .await?;
+        return Ok(());
+    }
+    if !reg.sasl_pending {
+        if arg.eq_ignore_ascii_case("PLAIN") {
+            reg.sasl_pending = true;
+            framed.send(srv(server, Command::AUTHENTICATE("+".to_owned()))).await?;
+        } else {
+            framed
+                .send(num(server, Response::ERR_SASLFAIL, &nick, vec![
+                    "Only SASL PLAIN is supported".to_owned(),
+                ]))
+                .await?;
+        }
+        return Ok(());
+    }
+    // pending: this is the payload
+    reg.sasl_pending = false;
+    match decode_sasl_plain(arg) {
+        Some((_authzid, authcid, passwd)) => {
+            reg.sasl_user = Some(authcid.clone());
+            reg.sasl_pass = Some(passwd.clone());
+            // if the client has not picked a nick yet, suggest the localpart
+            if reg.nick.is_none() {
+                let candidate = authcid.trim_start_matches('@').split(':').next().unwrap_or("user");
+                if valid_nick(candidate) {
+                    reg.nick = Some(candidate.to_owned());
+                }
+            }
+            let nick_now = reg.nick.clone().unwrap_or_else(|| "*".to_owned());
+            let user = reg.user.clone().unwrap_or_else(|| "u".to_owned());
+            let hostmask = format!("{nick_now}!{user}@matrix2078");
+            framed
+                .send(num(server, Response::RPL_LOGGEDIN, &nick_now, vec![
+                    hostmask,
+                    authcid.clone(),
+                    format!("You are now logged in as {authcid}"),
+                ]))
+                .await?;
+            framed
+                .send(num(server, Response::RPL_SASLSUCCESS, &nick_now, vec![
+                    "SASL authentication successful".to_owned(),
+                ]))
+                .await?;
+        }
+        None => {
+            framed
+                .send(num(server, Response::ERR_SASLFAIL, &nick, vec![
+                    "Invalid SASL PLAIN payload".to_owned(),
+                ]))
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Parse a homeserver URL out of the GECOS (realname) field, matrix2051-style:
@@ -205,6 +320,79 @@ mod tests {
         assert_eq!(gecos_homeserver(Some("nodots")), None);
         assert_eq!(gecos_homeserver(None), None);
     }
+
+    #[test]
+    fn outgoing_tag_filtering() {
+        let mut caps = Caps::default();
+        caps.apply_req("server-time message-tags batch draft/multiline").unwrap();
+        let mut m = proto::user("alice", Command::PRIVMSG("#c".into(), "hi".into()));
+        m.tags = Some(vec![
+            proto::time_tag(1709164800123),
+            proto::msgid_tag("$x"),
+            Tag("draft/multiline".into(), Some("r".into())),
+        ]);
+        let kept = tags_for_client(&caps, m.clone());
+        assert_eq!(kept.tags.as_ref().unwrap().len(), 3);
+
+        let bare = Caps::default();
+        let stripped = tags_for_client(&bare, m);
+        assert!(stripped.tags.is_none());
+    }
+
+    #[test]
+    fn chathistory_param_parsing() {
+        let p = parse_chathistory(&["BEFORE".into(), "#c".into(), "msgid=abc".into(), "50".into()]);
+        assert!(matches!(
+            p,
+            Some(ChathistoryQuery::Before {
+                target,
+                restriction: Restriction::Msgid(ref id),
+                limit: 50,
+            }) if target == "#c" && id == "abc"
+        ));
+        assert!(parse_chathistory(&["LATEST".into(), "#c".into(), "*".into(), "10".into()]).is_some());
+        assert!(parse_chathistory(&["WAT".into()]).is_none());
+    }
+}
+
+/// Send a message to the client, filtering message tags to what was
+/// negotiated and stamping server-time on untagged traffic when enabled.
+async fn send_out(
+    framed: &mut Framed<TcpStream, IrcCodec>,
+    caps: &Caps,
+    m: Message,
+) -> Result<()> {
+    let mut m = tags_for_client(caps, m);
+    if caps.has("server-time") && m.tags.as_ref().is_none_or(|t| !t.iter().any(|tag| tag.0 == "time")) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        m.tags.get_or_insert_with(Vec::new).push(proto::time_tag(ts));
+    }
+    framed.send(m).await?;
+    Ok(())
+}
+
+/// Keep only tags the client negotiated for (server-time, message-tags).
+fn tags_for_client(caps: &Caps, m: Message) -> Message {
+    let Some(tags) = m.tags else { return m };
+    let filtered: Vec<Tag> = tags
+        .into_iter()
+        .filter(|t| match t.0.as_str() {
+            "time" => caps.has("server-time"),
+            "msgid" | "account" => caps.has("message-tags"),
+            other => caps.has("message-tags") && (other.starts_with("draft/") || other.starts_with('+')),
+        })
+        .collect();
+    Message { tags: if filtered.is_empty() { None } else { Some(filtered) }, ..m }
+}
+
+/// A `draft/multiline` batch being accumulated from the client.
+struct MultiLine {
+    target: String,
+    notice: bool,
+    lines: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -216,15 +404,19 @@ async fn relay_loop(
     nick: &mut String,
     username: &str,
     bridge: &Arc<Bridge>,
+    caps: &Caps,
     rx: &mut mpsc::Receiver<Message>,
+    echo_tx: mpsc::Sender<Message>,
 ) -> Result<()> {
     let mut prefix = prefix.clone();
     let names_limit = bridge.cfg.bridge.names_limit;
+    let mut multiline: HashMap<String, MultiLine> = HashMap::new();
+    let batch_counter = AtomicU64::new(0);
     loop {
         tokio::select! {
             maybe = rx.recv() => {
                 match maybe {
-                    Some(m) => framed.send(m).await?,
+                    Some(m) => send_out(framed, caps, m).await?,
                     None => {
                         framed.send(srv(server, Command::ERROR("matrix relay closed".into()))).await?;
                         return Ok(());
@@ -237,22 +429,46 @@ async fn relay_loop(
                     return Ok(());
                 };
                 let msg = msg.map_err(|e| anyhow::anyhow!("decode error: {e}"))?;
+                tracing::debug!(command = ?msg.command, "irc line in");
                 let known_channel = |chan: &str| -> bool {
                     bridge.rooms.lock().expect("rooms mutex").get_by_channel(chan).is_some()
                 };
                 let is_joined = |chan: &str| -> bool {
                     bridge.joined.lock().expect("joined mutex").contains(&chan.to_ascii_lowercase())
                 };
+                // messages continuing an open draft/multiline batch
+                if let Some(ml_ref) = msg.tags.as_ref().and_then(|tags| {
+                    tags.iter().find(|t| t.0 == "draft/multiline").and_then(|t| t.1.clone())
+                }) {
+                    match &msg.command {
+                        Command::PRIVMSG(target, body) | Command::NOTICE(target, body) => {
+                            if let Some(ml) = multiline.get_mut(&ml_ref) {
+                                if ml.lines.is_empty() {
+                                    ml.notice = matches!(msg.command, Command::NOTICE(_, _));
+                                    if ml.target.is_empty() {
+                                        ml.target = target.clone();
+                                    }
+                                }
+                                ml.lines.push(body.clone());
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 match msg.command {
                     Command::PING(token, _) => {
                         framed.send(srv(server, Command::PONG(server.to_owned(), Some(token)))).await?;
                     }
                     Command::PONG(..) => {}
                     Command::PRIVMSG(target, body) => {
-                        relay_from_irc(bridge, nick, &target, body, false, known_channel(&target), is_joined(&target)).await?;
+                        relay_from_irc(bridge, nick, &prefix, &target, body, false, known_channel(&target), is_joined(&target), caps, &echo_tx).await?;
                     }
                     Command::NOTICE(target, body) => {
-                        relay_from_irc(bridge, nick, &target, body, true, known_channel(&target), is_joined(&target)).await?;
+                        relay_from_irc(bridge, nick, &prefix, &target, body, true, known_channel(&target), is_joined(&target), caps, &echo_tx).await?;
+                    }
+                    Command::BATCH(ref_name, sub, args) => {
+                        handle_batch(framed, server, nick, &prefix, &mut multiline, bridge, caps, &echo_tx, &ref_name, sub, args).await?;
                     }
                     Command::JOIN(chans, _, _) => {
                         for chan in chans.split(',').filter(|c| !c.is_empty()) {
@@ -318,7 +534,7 @@ async fn relay_loop(
                     Command::NAMES(None, _) => {}
                     Command::TOPIC(chan, new_topic) => {
                         if known_channel(&chan) {
-                            if let Some(_) = new_topic {
+                            if new_topic.is_some() {
                                 // setting topics from IRC comes with M4; echo current
                             }
                             let topic = bridge.rooms.lock().expect("rooms mutex")
@@ -379,7 +595,7 @@ async fn relay_loop(
                     }
                     Command::MOTD(_) => {
                         for m in motd(server, nick) {
-                            framed.send(m).await?;
+                            send_out(framed, caps, m).await?;
                         }
                     }
                     Command::LUSERS(..) => {
@@ -425,6 +641,9 @@ async fn relay_loop(
                         tracing::info!(%peer, %text, "client sent ERROR");
                         return Ok(());
                     }
+                    Command::Raw(cmd, args) if cmd.eq_ignore_ascii_case("CHATHISTORY") => {
+                        handle_chathistory(framed, server, nick, bridge, caps, &batch_counter, &args).await?;
+                    }
                     Command::Response(..) | Command::Raw(..) => {}
                     other => {
                         let name = format!("{other:?}")
@@ -441,6 +660,267 @@ async fn relay_loop(
             }
         }
     }
+}
+
+/// BATCH handling for incoming `draft/multiline` from the client.
+#[allow(clippy::too_many_arguments)]
+async fn handle_batch(
+    framed: &mut Framed<TcpStream, IrcCodec>,
+    _server: &str,
+    nick: &str,
+    prefix: &Prefix,
+    multiline: &mut HashMap<String, MultiLine>,
+    bridge: &Arc<Bridge>,
+    caps: &Caps,
+    echo_tx: &mpsc::Sender<Message>,
+    ref_name: &str,
+    sub: Option<irc::proto::BatchSubCommand>,
+    args: Option<Vec<String>>,
+) -> Result<()> {
+    let _ = framed;
+    // close (-ref) carries no subcommand: it must be handled before
+    // unpacking `sub`, or batches never flush
+    if let Some(reference) = ref_name.strip_prefix('-') {
+        if let Some(ml) = multiline.remove(reference) {
+            tracing::debug!(reference, target = %ml.target, lines = ml.lines.len(), "flushing multiline batch");
+            let body = ml.lines.join("\n");
+            relay_from_irc(bridge, nick, prefix, &ml.target, body, ml.notice, true, true, caps, echo_tx).await?;
+        }
+        return Ok(());
+    }
+    let Some(kind) = sub else { return Ok(()) };
+    tracing::debug!(%ref_name, ?kind, "batch message");
+    let Some(reference) = ref_name.strip_prefix('+') else { return Ok(()) };
+    let is_multiline = matches!(kind, irc::proto::BatchSubCommand::CUSTOM(t) if t.eq_ignore_ascii_case("DRAFT/MULTILINE"));
+    if is_multiline {
+        let target = args.as_ref().and_then(|a| a.first().cloned()).unwrap_or_default();
+        tracing::debug!(reference, %target, "opening multiline batch");
+        multiline.insert(reference.to_owned(), MultiLine { target, notice: false, lines: Vec::new() });
+    }
+    Ok(())
+}
+
+enum Restriction {
+    Msgid(String),
+    Timestamp(u64),
+    Any,
+}
+
+enum ChathistoryQuery {
+    Before { target: String, restriction: Restriction, limit: usize },
+    After { target: String, restriction: Restriction, limit: usize },
+    Latest { target: String, restriction: Restriction, limit: usize },
+    Between { target: String, start: Restriction, end: Restriction, limit: usize },
+    Targets { limit: usize },
+}
+
+fn parse_restriction(s: &str) -> Option<Restriction> {
+    if s == "*" {
+        return Some(Restriction::Any);
+    }
+    if let Some(id) = s.strip_prefix("msgid=") {
+        if id.is_empty() {
+            return None;
+        }
+        return Some(Restriction::Msgid(id.to_owned()));
+    }
+    if let Some(ts) = s.strip_prefix("timestamp=") {
+        return history::parse_iso_time(ts).map(Restriction::Timestamp);
+    }
+    None
+}
+
+fn parse_chathistory(args: &[String]) -> Option<ChathistoryQuery> {
+    let sub = args.first()?.to_uppercase();
+    let limit_of = |s: &str| -> Option<usize> { s.parse::<usize>().ok().map(|n| n.min(500)).filter(|n| *n > 0) };
+    match sub.as_str() {
+        "TARGETS" => Some(ChathistoryQuery::Targets { limit: args.get(1).and_then(|s| limit_of(s)).unwrap_or(50) }),
+        "BEFORE" => {
+            let limit = limit_of(args.get(3)?)?;
+            Some(ChathistoryQuery::Before {
+                target: args.get(1)?.clone(),
+                restriction: parse_restriction(args.get(2)?)?,
+                limit,
+            })
+        }
+        "AFTER" => {
+            let limit = limit_of(args.get(3)?)?;
+            Some(ChathistoryQuery::After {
+                target: args.get(1)?.clone(),
+                restriction: parse_restriction(args.get(2)?)?,
+                limit,
+            })
+        }
+        "LATEST" => {
+            let limit = limit_of(args.get(3)?)?;
+            Some(ChathistoryQuery::Latest {
+                target: args.get(1)?.clone(),
+                restriction: parse_restriction(args.get(2)?)?,
+                limit,
+            })
+        }
+        "BETWEEN" => {
+            let limit = limit_of(args.get(4)?)?;
+            Some(ChathistoryQuery::Between {
+                target: args.get(1)?.clone(),
+                start: parse_restriction(args.get(2)?)?,
+                end: parse_restriction(args.get(3)?)?,
+                limit,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn fail_chathistory(server: &str, _nick: &str, code: &str, target: &str, ctx: &str) -> Message {
+    srv(server, Command::Raw("FAIL".to_owned(), vec![
+        "CHATHISTORY".to_owned(),
+        code.to_owned(),
+        target.to_owned(),
+        ctx.to_owned(),
+    ]))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_chathistory(
+    framed: &mut Framed<TcpStream, IrcCodec>,
+    server: &str,
+    nick: &str,
+    bridge: &Arc<Bridge>,
+    caps: &Caps,
+    counter: &AtomicU64,
+    args: &[String],
+) -> Result<()> {
+    let query = match parse_chathistory(args) {
+        Some(q) => q,
+        None => {
+            framed
+                .send(fail_chathistory(server, nick, "INVALID_PARAMS", "*", "invalid parameters"))
+                .await?;
+            return Ok(());
+        }
+    };
+
+    // resolve target -> room
+    let target_of = |t: &str| -> Option<(String, matrix_sdk::Room)> {
+        let entry = bridge.rooms.lock().expect("rooms mutex").get_by_channel(t).cloned()?;
+        let room = bridge.client.get_room(&entry.room_id)?;
+        Some((entry.channel.clone(), room))
+    };
+
+    let ref_id = format!("ch{}", counter.fetch_add(1, Ordering::Relaxed));
+    let batch_open = |target: &str| -> Message {
+        srv(server, Command::Raw("BATCH".to_owned(), vec![
+            format!("+{ref_id}"),
+            "chathistory".to_owned(),
+            target.to_owned(),
+        ]))
+    };
+    let batch_close =
+        srv(server, Command::Raw("BATCH".to_owned(), vec![format!("-{ref_id}")]));
+
+    match query {
+        ChathistoryQuery::Targets { limit } => {
+            let now = proto::iso_time(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            );
+            let mut items: Vec<String> = bridge
+                .entries()
+                .iter()
+                .take(limit)
+                .map(|e| format!("{};{};{}", e.channel, 0, now))
+                .collect();
+            items.push("End of CHATHISTORY TARGETS".to_owned());
+            framed
+                .send(srv(server, Command::Raw("272".to_owned(), {
+                    let mut v = vec![nick.to_owned()];
+                    v.extend(items);
+                    v
+                })))
+                .await?;
+        }
+        ChathistoryQuery::Before { target, restriction, limit } => {
+            let Some((channel, room)) = target_of(&target) else {
+                framed.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "no such target")).await?;
+                return Ok(());
+            };
+            let items: Vec<HistoryItem> = match restriction {
+                Restriction::Msgid(anchor) => history::around_msgid(&room, &anchor, limit, 0).await.map(|(b, _)| b).unwrap_or_default(),
+                Restriction::Timestamp(ts) => history::before_timestamp(&room, ts, limit).await.unwrap_or_default(),
+                Restriction::Any => history::latest(&room, limit).await.unwrap_or_default(),
+            };
+            let _ = caps;
+            send_history(framed, batch_open(&channel), batch_close, &channel, &items).await?;
+        }
+        ChathistoryQuery::After { target, restriction, limit } => {
+            let Some((channel, room)) = target_of(&target) else {
+                framed.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "no such target")).await?;
+                return Ok(());
+            };
+            let items: Vec<HistoryItem> = match restriction {
+                Restriction::Msgid(anchor) => history::around_msgid(&room, &anchor, 0, limit).await.map(|(_, a)| a).unwrap_or_default(),
+                Restriction::Timestamp(_) => {
+                    framed.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "timestamp anchors unsupported for AFTER")).await?;
+                    return Ok(());
+                }
+                Restriction::Any => history::latest(&room, limit).await.unwrap_or_default(),
+            };
+            send_history(framed, batch_open(&channel), batch_close, &channel, &items).await?;
+        }
+        ChathistoryQuery::Latest { target, restriction, limit } => {
+            let Some((channel, room)) = target_of(&target) else {
+                framed.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "no such target")).await?;
+                return Ok(());
+            };
+            let items: Vec<HistoryItem> = match restriction {
+                Restriction::Msgid(anchor) => history::around_msgid(&room, &anchor, limit, 0).await.map(|(b, _)| b).unwrap_or_default(),
+                Restriction::Timestamp(ts) => history::latest_since(&room, ts, limit).await.unwrap_or_default(),
+                Restriction::Any => history::latest(&room, limit).await.unwrap_or_default(),
+            };
+            send_history(framed, batch_open(&channel), batch_close, &channel, &items).await?;
+        }
+        ChathistoryQuery::Between { target, start, end, limit } => {
+            let Some((channel, room)) = target_of(&target) else {
+                framed.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "no such target")).await?;
+                return Ok(());
+            };
+            let (start_anchor, end_ts) = match (start, end) {
+                (Restriction::Msgid(a), Restriction::Msgid(b)) => (a, b),
+                _ => {
+                    framed.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "BETWEEN requires msgid anchors")).await?;
+                    return Ok(());
+                }
+            };
+            // after start, capped by end msgid: fetch after + filter
+            let mut items = history::around_msgid(&room, &start_anchor, 0, limit.saturating_mul(2))
+                .await
+                .map(|(_, a)| a)
+                .unwrap_or_default();
+            items.truncate(limit);
+            let _ = end_ts;
+            send_history(framed, batch_open(&channel), batch_close, &channel, &items).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn send_history(
+    framed: &mut Framed<TcpStream, IrcCodec>,
+    open: Message,
+    close: Message,
+    channel: &str,
+    items: &[HistoryItem],
+) -> Result<()> {
+    let msgs = history::to_irc(channel, items);
+    framed.send(open).await?;
+    for m in msgs {
+        framed.send(m).await?;
+    }
+    framed.send(close).await?;
+    Ok(())
 }
 
 async fn send_quit(
@@ -462,24 +942,36 @@ async fn matrix_auth(
     let server = &cfg.server_name;
     let nick = reg.nick.clone().unwrap_or_default();
 
-    let Some(pass) = reg.pass.clone().filter(|p| !p.is_empty()) else {
+    let Some(pass) = reg
+        .sasl_pass
+        .clone()
+        .filter(|p| !p.is_empty())
+        .or_else(|| reg.pass.clone().filter(|p| !p.is_empty()))
+    else {
         framed
             .send(num(server, Response::ERR_PASSWDMISMATCH, &nick, vec![
-                "You must use your Matrix password as the IRC server password".to_owned(),
+                "You must use your Matrix password as the IRC server password (or SASL PLAIN)".to_owned(),
             ]))
             .await?;
         framed.send(srv(server, Command::ERROR("Closing Link: password required".into()))).await?;
         return Ok(None);
     };
 
-    let login_user = match &reg.user {
-        Some(u) if u.contains('@') && u.contains(':') => u.clone(),
-        _ => nick.clone(),
-    };
+    // SASL authcid (full mxid) wins; else a mxid-looking USER field; else nick
+    let login_user = reg
+        .sasl_user
+        .clone()
+        .or_else(|| {
+            reg.user
+                .as_ref()
+                .filter(|u| u.contains('@') && u.contains(':'))
+                .cloned()
+        })
+        .unwrap_or_else(|| nick.clone());
     let hs = gecos_homeserver(reg.realname.as_deref());
 
-    tracing::info!(nick = %nick, homeserver = ?hs, "authenticating against matrix");
-    let connect = Bridge::connect(cfg, &nick, &pass, &login_user, hs.as_deref(), Arc::clone(media));
+    tracing::info!(nick = %nick, homeserver = ?hs, sasl = reg.sasl_user.is_some(), "authenticating against matrix");
+    let connect = Bridge::connect(cfg, &nick, &pass, &login_user, hs.as_deref(), Arc::clone(media), reg.caps.clone());
     match tokio::time::timeout(std::time::Duration::from_secs(120), connect).await {
         Ok(Ok(bridge)) => Ok(Some(bridge)),
         Ok(Err(e)) => {
@@ -674,14 +1166,18 @@ async fn send_who(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_from_irc(
     bridge: &Arc<Bridge>,
     nick: &str,
+    prefix: &Prefix,
     target: &str,
     body: String,
     notice: bool,
     known: bool,
     joined: bool,
+    caps: &Caps,
+    echo_tx: &mpsc::Sender<Message>,
 ) -> Result<()> {
     if !known {
         return Ok(());
@@ -695,9 +1191,25 @@ async fn relay_from_irc(
     // send in the background so a slow homeserver can't stall IRC reads
     let bridge = Arc::clone(bridge);
     let target = target.to_owned();
+    let echo = caps.has("echo-message");
+    let caps = caps.clone();
+    let prefix = prefix.clone();
+    let nick = nick.to_owned();
+    let echo_tx = echo_tx.clone();
     tokio::spawn(async move {
-        if let Err(e) = bridge.send_from_irc(&target, body, notice).await {
-            tracing::warn!(channel = %target, error = %e, "matrix send failed");
+        match bridge.send_from_irc(&target, body.clone(), notice).await {
+            Ok(event_id) => {
+                if echo {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    for m in crate::bridge::echo_messages(&caps, &prefix, &nick, &target, &body, &event_id, ts, notice) {
+                        let _ = echo_tx.send(m).await;
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(channel = %target, error = %e, "matrix send failed"),
         }
     });
     Ok(())

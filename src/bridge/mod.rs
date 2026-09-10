@@ -13,11 +13,14 @@ use matrix_sdk::{
     config::SyncSettings,
     ruma::{
         OwnedRoomId,
-        events::room::{
-            MediaSource,
-            message::{MessageType, RoomMessageEventContent, SyncRoomMessageEvent},
-            name::SyncRoomNameEvent,
-            topic::SyncRoomTopicEvent,
+        events::{
+            presence::PresenceEvent,
+            room::{
+                MediaSource,
+                message::{MessageType, RoomMessageEventContent, SyncRoomMessageEvent},
+                name::SyncRoomNameEvent,
+                topic::SyncRoomTopicEvent,
+            },
         },
     },
 };
@@ -26,11 +29,12 @@ use tokio::sync::mpsc;
 use crate::{
     bridge::rooms::{RoomEntry, RoomMaps},
     config::Config,
-    ircd::proto,
+    ircd::{caps::Caps, proto},
     matrix::client::login_or_restore,
     media::MediaServer,
 };
 
+pub mod history;
 pub mod rooms;
 
 /// Shared per-user bridge state visible to event handlers.
@@ -42,6 +46,8 @@ pub struct Bridge {
     pub joined: Arc<Mutex<HashSet<String>>>,
     pub cfg: Arc<Config>,
     pub media: Arc<MediaServer>,
+    /// Capabilities negotiated by the owning IRC connection.
+    pub caps: Caps,
 }
 
 impl Bridge {
@@ -54,6 +60,7 @@ impl Bridge {
         login_user: &str,
         hs_override: Option<&str>,
         media: Arc<MediaServer>,
+        caps: Caps,
     ) -> Result<Arc<Self>> {
         let client = login_or_restore(cfg, nick, irc_pass, login_user, hs_override).await?;
 
@@ -66,7 +73,7 @@ impl Bridge {
             .map(|u| u.to_owned())
             .ok_or_else(|| anyhow::anyhow!("client has no user id after sync"))?;
 
-        let maps_path = channels_path(&cfg.state_dir, nick);
+        let maps_path = channels_path(&cfg.state_dir, &crate::matrix::client::state_key(nick, login_user));
         let mut maps = RoomMaps::load(maps_path);
         let live: HashSet<OwnedRoomId> =
             client.joined_rooms().iter().map(|r| r.room_id().to_owned()).collect();
@@ -86,6 +93,7 @@ impl Bridge {
             joined: Arc::new(Mutex::new(HashSet::new())),
             cfg: cfg.clone(),
             media,
+            caps,
         }))
     }
 
@@ -142,7 +150,8 @@ impl Bridge {
     /// Register event handlers pushing relayed IRC lines into `tx`.
     pub fn relay_matrix_to_irc(&self, tx: mpsc::Sender<Message>) {
         self.message_handler(tx.clone());
-        self.topic_handler(tx);
+        self.topic_handler(tx.clone());
+        self.presence_handler(tx);
     }
 
     fn message_handler(&self, tx: mpsc::Sender<Message>) {
@@ -151,6 +160,7 @@ impl Bridge {
         let own = self.own_mxid.clone();
         let cfg = Arc::clone(&self.cfg);
         let media = Arc::clone(&self.media);
+        let caps = self.caps.clone();
         self.client.add_event_handler(
             move |ev: SyncRoomMessageEvent, room: Room, client: Client| {
                 let tx = tx.clone();
@@ -159,6 +169,7 @@ impl Bridge {
                 let own = own.clone();
                 let cfg = Arc::clone(&cfg);
                 let media = Arc::clone(&media);
+                let caps = caps.clone();
                 async move {
                     let matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(ev) = ev else {
                         return;
@@ -227,14 +238,57 @@ impl Bridge {
                             .await;
                     }
 
-                    let cmd = match &ev.content.msgtype {
-                        MessageType::Emote(_) => {
-                            Command::PRIVMSG(channel, format!("\u{1}ACTION {body}\u{1}"))
+                    let ts = u64::from(ev.origin_server_ts.get());
+                    let msgid = ev.event_id.to_string();
+                    let is_notice = matches!(&ev.content.msgtype, MessageType::Notice(_));
+                    let is_emote = matches!(&ev.content.msgtype, MessageType::Emote(_));
+                    let sender_prefix = proto::user_prefix(&nick);
+                    let msgs = body_to_irc(&caps, &sender_prefix, &channel, &body, &msgid, ts, is_notice, is_emote);
+                    for m in msgs {
+                        let _ = tx.send(m).await;
+                    }
+                }
+            },
+        );
+    }
+
+    /// away-notify: mirror Matrix presence changes of other users.
+    fn presence_handler(&self, tx: mpsc::Sender<Message>) {
+        let seen_away: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        self.client.add_event_handler(
+            move |ev: PresenceEvent| {
+                let tx = tx.clone();
+                let seen = Arc::clone(&seen_away);
+                async move {
+                    let nick = proto::mxid_to_nick(ev.sender.as_str());
+                    let away = ev.content.presence
+                        == matrix_sdk::ruma::presence::PresenceState::Unavailable;
+                    let fire = {
+                        let mut s = seen.lock().expect("away mutex");
+                        let known = s.contains(&nick);
+                        if away && !known {
+                            s.insert(nick.clone());
+                            true
+                        } else if !away && known {
+                            s.remove(&nick);
+                            true
+                        } else {
+                            false
                         }
-                        MessageType::Notice(_) => Command::NOTICE(channel, body),
-                        _ => Command::PRIVMSG(channel, body),
                     };
-                    let _ = tx.send(proto::user(&nick, cmd)).await;
+                    if fire {
+                        let reason = ev
+                            .content
+                            .status_msg
+                            .clone()
+                            .unwrap_or_else(|| "away".to_owned());
+                        let cmd = if away {
+                            Command::AWAY(Some(reason))
+                        } else {
+                            Command::AWAY(None)
+                        };
+                        let _ = tx.send(proto::user(&nick, cmd)).await;
+                    }
                 }
             },
         );
@@ -278,8 +332,13 @@ impl Bridge {
         tokio::spawn(sync_forever(client))
     }
 
-    /// Deliver an IRC line to the mapped Matrix room.
-    pub async fn send_from_irc(&self, channel: &str, body: String, notice: bool) -> Result<()> {
+    /// Deliver an IRC line to the mapped Matrix room. Returns the new event id.
+    pub async fn send_from_irc(
+        &self,
+        channel: &str,
+        body: String,
+        notice: bool,
+    ) -> Result<String> {
         let room_id = {
             let maps = self.rooms.lock().expect("rooms mutex");
             maps.get_by_channel(channel).map(|e| e.room_id.clone())
@@ -295,17 +354,161 @@ impl Bridge {
         } else {
             RoomMessageEventContent::text_plain(body)
         };
-        room.send(content)
+        let resp = room
+            .send(content)
             .await
-            .map(|_| ())
             .context("sending message to matrix room")?;
-        Ok(())
+        Ok(resp.response.event_id.to_string())
     }
 
     /// Snapshot of mapped rooms for the initial JOIN burst.
     pub fn entries(&self) -> Vec<RoomEntry> {
         self.rooms.lock().expect("rooms mutex").entries().to_vec()
     }
+}
+
+/// Build outgoing IRC message(s) for a Matrix body:
+/// - multiline-capable clients get a `draft/multiline` batch;
+/// - everyone else gets one PRIVMSG per line, word-wrapped.
+fn body_to_irc(
+    caps: &Caps,
+    sender: &irc::proto::Prefix,
+    channel: &str,
+    body: &str,
+    msgid: &str,
+    ts: u64,
+    notice: bool,
+    emote: bool,
+) -> Vec<Message> {
+    let lines = wrap_body(body);
+    let mk_cmd = |line: String| -> Command {
+        if notice {
+            Command::NOTICE(channel.to_owned(), line)
+        } else if emote {
+            Command::PRIVMSG(channel.to_owned(), format!("\u{1}ACTION {line}\u{1}"))
+        } else {
+            Command::PRIVMSG(channel.to_owned(), line)
+        }
+    };
+    let tags_for = |multiline_ref: Option<&str>| -> Vec<irc::proto::message::Tag> {
+        let mut tags = vec![proto::time_tag(ts), proto::msgid_tag(msgid)];
+        if let Some(r) = multiline_ref {
+            tags.push(irc::proto::message::Tag(
+                "draft/multiline".to_owned(),
+                Some(r.to_owned()),
+            ));
+        }
+        tags
+    };
+
+    if caps.has("draft/multiline") && caps.has("batch") && caps.has("message-tags") {
+        // one batch per message, ref derived from the event id
+        let reference = format!("m.{}", msgid.trim_start_matches('$'));
+        let mut out = vec![Message {
+            tags: None,
+            prefix: Some(sender.clone()),
+            command: Command::Raw(
+                "BATCH".to_owned(),
+                vec![
+                    format!("+{reference}"),
+                    "draft/multiline".to_owned(),
+                    channel.to_owned(),
+                ],
+            ),
+        }];
+        for line in lines {
+            let m = Message {
+                tags: Some(tags_for(Some(&reference))),
+                prefix: Some(sender.clone()),
+                command: mk_cmd(line),
+            };
+            out.push(m);
+        }
+        out.push(Message {
+            tags: None,
+            prefix: Some(sender.clone()),
+            command: Command::Raw("BATCH".to_owned(), vec![format!("-{reference}")]),
+        });
+        out
+    } else {
+        lines
+            .into_iter()
+            .map(|line| Message {
+                tags: Some(tags_for(None)),
+                prefix: Some(sender.clone()),
+                command: mk_cmd(line),
+            })
+            .collect()
+    }
+}
+
+/// Build echo-message line(s) for the client's own Matrix delivery.
+pub fn echo_messages(
+    caps: &Caps,
+    prefix: &irc::proto::Prefix,
+    _nick: &str,
+    target: &str,
+    body: &str,
+    event_id: &str,
+    ts: u64,
+    notice: bool,
+) -> Vec<Message> {
+    body_to_irc(caps, prefix, target, body, event_id, ts, notice, false)
+}
+
+/// Split a body into IRC-safe lines: split on newlines, then word-wrap any
+/// over-long line (port of matrix2051's word_wrap idea).
+pub fn wrap_body(body: &str) -> Vec<String> {
+    const WIDTH: usize = 400; // leaves headroom for tags+prefix within 512
+    let mut out = Vec::new();
+    for line in body.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.chars().count() <= WIDTH {
+            out.push(line.to_owned());
+            continue;
+        }
+        let mut current = String::new();
+        for word in line.split(' ') {
+            let wlen = word.chars().count();
+            if current.is_empty() {
+                if wlen > WIDTH {
+                    // unbreakable monster word: hard-chop
+                    for chunk in chunks(word, WIDTH) {
+                        out.push(chunk.to_owned());
+                    }
+                } else {
+                    current.push_str(word);
+                }
+            } else if current.chars().count() + 1 + wlen <= WIDTH {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut current));
+                current.push_str(word);
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn chunks(s: &str, width: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < s.len() {
+        let mut end = (start + width).min(s.len());
+        while end < s.len() && !s.is_char_boundary(end) {
+            end += 1;
+        }
+        out.push(&s[start..end]);
+        start = end;
+    }
+    out
 }
 
 async fn push_topic(
