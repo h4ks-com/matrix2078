@@ -1,8 +1,9 @@
-# Live session: connect, register, keep reading for N seconds, dump to a file.
+# Send a PRIVMSG to a channel after registering. Usage: ircsend.ps1 <channel> <text>
 param(
+    [string]$Channel = '#m2078-v12',
+    [string]$Text = 'hello',
     [int]$Port = 2078,
-    [int]$HoldSec = 20,
-    [string]$OutFile = "$env:TEMP\opencode\irc-live.log"
+    [int]$TimeoutSec = 20
 )
 
 $pass = (Select-String -Path 'D:\matrix2078\dev\test-creds.env' -Pattern '^MATRIX2078_IT_PASS=(.+)$').Matches[0].Groups[1].Value
@@ -26,11 +27,15 @@ function Read-Available {
 $w.WriteLine("PASS $pass")
 $w.WriteLine('NICK m2078')
 $w.WriteLine('USER @m2078:doesnmlab.xyz 0 * :https://matrix.doesnmlab.xyz')
-
-$deadline = (Get-Date).AddSeconds($HoldSec)
+Start-Sleep -Seconds 6
+Read-Available
+$w.WriteLine("PRIVMSG $Channel :$Text")
+Start-Sleep -Seconds 3
+$deadline = (Get-Date).AddSeconds($TimeoutSec - 9)
 while ((Get-Date) -lt $deadline) {
     Read-Available
     Start-Sleep -Milliseconds 200
 }
 $c.Close()
-$out.ToString() | Set-Content -Path $OutFile -Encoding UTF8
+$out.ToString() | Set-Content -Path "$env:TEMP\opencode\irc-send.log" -Encoding UTF8
+"done"

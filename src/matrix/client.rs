@@ -43,18 +43,22 @@ async fn build_client(homeserver: &str, sqlite_dir: &Path) -> Result<Client> {
 ///
 /// `login_user` is the Matrix user id (or localpart) used for a fresh login:
 /// taken from the USER field when it looks like an mxid, else the nick.
+/// `hs_override` (GECOS/config/env) wins over the stored homeserver.
 pub async fn login_or_restore(
     cfg: &Config,
     nick: &str,
     irc_pass: &str,
     login_user: &str,
+    hs_override: Option<&str>,
 ) -> Result<Client> {
     let dir = user_dir(&cfg.state_dir, nick);
     let sqlite_dir = dir.join("sqlite");
 
     if super::session::session_path(&dir).exists() {
         let ps: PersistedSession = load(&dir, irc_pass)?;
-        let homeserver = cfg.homeserver.clone().unwrap_or(ps.homeserver.clone());
+        let homeserver = hs_override
+            .map(str::to_owned)
+            .unwrap_or_else(|| cfg.homeserver.clone().unwrap_or(ps.homeserver.clone()));
         let client = build_client(&homeserver, &sqlite_dir).await?;
         let user_id = ps.session.meta.user_id.clone();
         client
@@ -71,10 +75,15 @@ pub async fn login_or_restore(
                  (or MATRIX2078_ALLOW_REGISTER=1) to create one"
             );
         }
-        let homeserver = cfg
-            .homeserver
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("homeserver not configured; set it in matrix2078.toml or MATRIX2078_HOMESERVER"))?;
+        let homeserver = hs_override
+            .map(str::to_owned)
+            .or_else(|| cfg.homeserver.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "homeserver not configured; set it in matrix2078.toml, \
+                     MATRIX2078_HOMESERVER, or the IRC realname (GECOS) field"
+                )
+            })?;
         let client = build_client(&homeserver, &sqlite_dir).await?;
         client
             .matrix_auth()

@@ -27,7 +27,13 @@ matrix2051 had five fatal flaws, all fixed here by design:
 
 ## Status
 
-M0 (scaffold + minimal IRCd + one-room relay). See `AGENTS.md` for the
+M0 + M1 done: minimal IRCd, persistent Matrix sessions, **all joined rooms
+bridged automatically** (matrix2051-style), stable per-room channel names
+(room renames surface as TOPIC, never as channel renames), room version 12
+works, authenticated media pipeline (images/files are downloaded with the
+access token, cached locally and served at stable
+`http://127.0.0.1:2079/...` URLs), and capped NAMES/WHO replies so
+thousand-member rooms don't freeze IRC clients. See `AGENTS.md` for the
 milestone plan up to M6 (goguma/voidbar compat passes).
 
 ## Usage
@@ -40,17 +46,19 @@ Then connect an IRC client to `127.0.0.1:2078`:
 
 - **server password**: your Matrix account password
 - **nick**: your Matrix localpart (e.g. `m2078` for `@m2078:example.org`)
-- for the very first login you can put the full `@user:domain` into the
-  IRC *username* field, or configure `homeserver` in `matrix2078.toml`
+- **username** (optional): full `@user:domain` for the first login
+- **realname** (GECOS): your homeserver URL, matrix2051-style (optional if
+  configured in `matrix2078.toml`)
 
-The Matrix session (tokens + state) is stored encrypted under `state/`
-(keyed by argon2 + XChaCha20-Poly1305 under your IRC password) and reused on
-every reconnect — no device spam. After the first registration,
-`--allow-register` is no longer needed.
+Every joined room appears as an IRC channel automatically. The Matrix
+session (tokens + state) is stored encrypted under `state/` (keyed by argon2
++ XChaCha20-Poly1305 under your IRC password) and reused on every reconnect
+— no device spam. After the first registration, `--allow-register` is no
+longer needed.
 
 Configuration: `matrix2078.toml` and `MATRIX2078_*` environment variables
-(`MATRIX2078_LISTEN`, `MATRIX2078_STATE_DIR`, `MATRIX2078_HOMESERVER`,
-`MATRIX2078_BRIDGE_ROOM`, `MATRIX2078_BRIDGE_CHANNEL`,
+(`MATRIX2078_LISTEN`, `MATRIX2078_MEDIA_LISTEN`, `MATRIX2078_STATE_DIR`,
+`MATRIX2078_HOMESERVER`, `MATRIX2078_NAMES_LIMIT`,
 `MATRIX2078_ALLOW_REGISTER`), plus `RUST_LOG` for log filtering.
 
 ## License

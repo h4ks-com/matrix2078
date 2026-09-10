@@ -16,17 +16,31 @@ use crate::{
         proto::{client_prefix, from_client, num, srv},
         session::{Registration, valid_nick},
     },
+    media::MediaServer,
 };
 
 pub async fn run(cfg: Arc<Config>) -> Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
     tracing::info!(listen = %cfg.listen, server = %cfg.server_name, "ircd listening");
+    let media = Arc::new(MediaServer::new(
+        cfg.media_listen,
+        crate::matrix::media::cache_dir(&cfg.state_dir),
+    ));
+    {
+        let media = Arc::clone(&media);
+        tokio::spawn(async move {
+            if let Err(e) = media.run().await {
+                tracing::error!(error = %e, "media server failed to start");
+            }
+        });
+    }
     loop {
         let (stream, peer) = listener.accept().await?;
         tracing::info!(%peer, "client connected");
         let cfg = cfg.clone();
+        let media = Arc::clone(&media);
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, peer, cfg).await {
+            if let Err(e) = handle_conn(stream, peer, cfg, media).await {
                 tracing::info!(%peer, error = %e, "connection closed with error");
             } else {
                 tracing::info!(%peer, "connection closed");
@@ -35,7 +49,12 @@ pub async fn run(cfg: Arc<Config>) -> Result<()> {
     }
 }
 
-async fn handle_conn(stream: TcpStream, peer: SocketAddr, cfg: Arc<Config>) -> Result<()> {
+async fn handle_conn(
+    stream: TcpStream,
+    peer: SocketAddr,
+    cfg: Arc<Config>,
+    media: Arc<MediaServer>,
+) -> Result<()> {
     stream.set_nodelay(true).ok();
     let codec = IrcCodec::new("UTF-8")?;
     let mut framed = Framed::new(stream, codec);
@@ -91,7 +110,7 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, cfg: Arc<Config>) -> R
             _ => {}
         }
         if reg.is_complete() {
-            match matrix_auth(&mut framed, &cfg, &reg).await? {
+            match matrix_auth(&mut framed, &cfg, &reg, &media).await? {
                 Some(bridge) => break bridge,
                 None => return Ok(()),
             }
@@ -102,24 +121,44 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, cfg: Arc<Config>) -> R
     let mut nick = reg.nick.clone().unwrap_or_default();
     let username = irc_username(reg.user.as_deref().unwrap_or("u"));
     let prefix = client_prefix(&nick, &username);
-    let channel = bridge.channel.clone();
 
     for m in welcome_burst(&server, &nick) {
         framed.send(m).await?;
     }
 
-    // force-join the relayed channel before any PRIVMSG can reference it
-    send_join(&mut framed, &server, &prefix, &nick, &bridge).await?;
+    // JOIN every mapped room's channel before any PRIVMSG can reference it
+    for entry in bridge.entries() {
+        bridge.joined.lock().expect("joined mutex").insert(entry.channel.to_ascii_lowercase());
+        send_join(&mut framed, &server, &prefix, &nick, &entry, &bridge, cfg.bridge.names_limit)
+            .await?;
+    }
 
-    let (tx, mut rx) = mpsc::channel::<Message>(64);
+    let (tx, mut rx) = mpsc::channel::<Message>(256);
     bridge.relay_matrix_to_irc(tx);
     let sync_task = bridge.spawn_sync();
 
-    let result = relay_loop(&mut framed, &peer, &server, &prefix, &mut nick, &username, &channel, &bridge, &mut rx).await;
+    let result =
+        relay_loop(&mut framed, &peer, &server, &prefix, &mut nick, &username, &bridge, &mut rx)
+            .await;
     // the matrix sync loop must not outlive the IRC connection: it holds the
     // device's sync position and would block the next session of this user
     sync_task.abort();
     result
+}
+
+/// Parse a homeserver URL out of the GECOS (realname) field, matrix2051-style:
+/// accepts `https://host`, `http://host` or a bare `host`.
+fn gecos_homeserver(realname: Option<&str>) -> Option<String> {
+    let raw = realname?.trim();
+    let has_scheme = raw.starts_with("https://") || raw.starts_with("http://");
+    if raw.is_empty() || raw.contains(char::is_whitespace) || (!has_scheme && !raw.contains('.')) {
+        return None;
+    }
+    if has_scheme {
+        Some(raw.trim_end_matches('/').to_owned())
+    } else {
+        Some(format!("https://{}", raw.trim_end_matches('/')))
+    }
 }
 
 /// Sanitize the USER field into a sane IRC username: if it is a full mxid,
@@ -150,6 +189,22 @@ mod tests {
         assert_eq!(irc_username("has spaces"), "has_spaces");
         assert_eq!(irc_username(":::"), "u");
     }
+
+    #[test]
+    fn gecos_homeserver_parsing() {
+        assert_eq!(
+            gecos_homeserver(Some("https://matrix.doesnmlab.xyz")).as_deref(),
+            Some("https://matrix.doesnmlab.xyz")
+        );
+        assert_eq!(
+            gecos_homeserver(Some("matrix.doesnmlab.xyz/")).as_deref(),
+            Some("https://matrix.doesnmlab.xyz")
+        );
+        assert_eq!(gecos_homeserver(Some("http://localhost:8008")).as_deref(), Some("http://localhost:8008"));
+        assert_eq!(gecos_homeserver(Some("just a guy")), None);
+        assert_eq!(gecos_homeserver(Some("nodots")), None);
+        assert_eq!(gecos_homeserver(None), None);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -160,14 +215,11 @@ async fn relay_loop(
     prefix: &Prefix,
     nick: &mut String,
     username: &str,
-    channel: &str,
-    bridge: &Bridge,
+    bridge: &Arc<Bridge>,
     rx: &mut mpsc::Receiver<Message>,
 ) -> Result<()> {
     let mut prefix = prefix.clone();
-    let mut joined = true;
-    let server_owned = server.to_owned();
-    let server = server_owned.as_str();
+    let names_limit = bridge.cfg.bridge.names_limit;
     loop {
         tokio::select! {
             maybe = rx.recv() => {
@@ -185,22 +237,30 @@ async fn relay_loop(
                     return Ok(());
                 };
                 let msg = msg.map_err(|e| anyhow::anyhow!("decode error: {e}"))?;
+                let known_channel = |chan: &str| -> bool {
+                    bridge.rooms.lock().expect("rooms mutex").get_by_channel(chan).is_some()
+                };
+                let is_joined = |chan: &str| -> bool {
+                    bridge.joined.lock().expect("joined mutex").contains(&chan.to_ascii_lowercase())
+                };
                 match msg.command {
                     Command::PING(token, _) => {
                         framed.send(srv(server, Command::PONG(server.to_owned(), Some(token)))).await?;
                     }
                     Command::PONG(..) => {}
                     Command::PRIVMSG(target, body) => {
-                        relay_from_irc(framed, bridge, server, nick, &target, body, false, joined).await?;
+                        relay_from_irc(bridge, nick, &target, body, false, known_channel(&target), is_joined(&target)).await?;
                     }
                     Command::NOTICE(target, body) => {
-                        relay_from_irc(framed, bridge, server, nick, &target, body, true, joined).await?;
+                        relay_from_irc(bridge, nick, &target, body, true, known_channel(&target), is_joined(&target)).await?;
                     }
                     Command::JOIN(chans, _, _) => {
                         for chan in chans.split(',').filter(|c| !c.is_empty()) {
-                            if chan.eq_ignore_ascii_case(channel) {
-                                joined = true;
-                                send_join(framed, server, &prefix, nick, bridge).await?;
+                            if known_channel(chan) {
+                                bridge.joined.lock().expect("joined mutex").insert(chan.to_ascii_lowercase());
+                                let entry = bridge.rooms.lock().expect("rooms mutex")
+                                    .get_by_channel(chan).cloned().expect("checked above");
+                                send_join(framed, server, &prefix, nick, &entry, bridge, names_limit).await?;
                             } else {
                                 framed.send(num(server, Response::ERR_NOSUCHCHANNEL, nick, vec![
                                     chan.to_owned(),
@@ -211,8 +271,8 @@ async fn relay_loop(
                     }
                     Command::PART(chans, comment) => {
                         for chan in chans.split(',').filter(|c| !c.is_empty()) {
-                            if chan.eq_ignore_ascii_case(channel) {
-                                joined = false;
+                            if known_channel(chan) {
+                                bridge.joined.lock().expect("joined mutex").remove(&chan.to_ascii_lowercase());
                                 framed.send(from_client(&prefix, Command::PART(chan.to_owned(), comment.clone()))).await?;
                             } else {
                                 framed.send(num(server, Response::ERR_NOSUCHCHANNEL, nick, vec![
@@ -223,8 +283,8 @@ async fn relay_loop(
                         }
                     }
                     Command::WHO(Some(mask), _) => {
-                        if mask.eq_ignore_ascii_case(channel) {
-                            send_who(framed, server, nick, channel, &bridge.members).await?;
+                        if known_channel(&mask) {
+                            send_who(framed, server, nick, &mask, bridge, names_limit).await?;
                         } else {
                             framed.send(num(server, Response::RPL_ENDOFWHO, nick, vec![
                                 mask,
@@ -233,13 +293,39 @@ async fn relay_loop(
                         }
                     }
                     Command::WHO(None, _) => {
-                        send_who(framed, server, nick, channel, &bridge.members).await?;
+                        // no mask: end-of for all joined channels
+                        let chans: Vec<String> =
+                            bridge.joined.lock().expect("joined mutex").iter().cloned().collect();
+                        for chan in chans {
+                            framed.send(num(server, Response::RPL_ENDOFWHO, nick, vec![
+                                chan,
+                                "End of WHO list".to_owned(),
+                            ])).await?;
+                        }
                     }
-                    Command::TOPIC(chan, _) => {
-                        if chan.eq_ignore_ascii_case(channel) {
+                    Command::NAMES(Some(chans), _) => {
+                        for chan in chans.split(',').filter(|c| !c.is_empty()) {
+                            if known_channel(chan) {
+                                send_names(framed, server, nick, chan, bridge, names_limit).await?;
+                            } else {
+                                framed.send(num(server, Response::RPL_ENDOFNAMES, nick, vec![
+                                    chan.to_owned(),
+                                    "End of /NAMES list".to_owned(),
+                                ])).await?;
+                            }
+                        }
+                    }
+                    Command::NAMES(None, _) => {}
+                    Command::TOPIC(chan, new_topic) => {
+                        if known_channel(&chan) {
+                            if let Some(_) = new_topic {
+                                // setting topics from IRC comes with M4; echo current
+                            }
+                            let topic = bridge.rooms.lock().expect("rooms mutex")
+                                .get_by_channel(&chan).map(|e| e.topic.clone()).unwrap_or_default();
                             framed.send(num(server, Response::RPL_TOPIC, nick, vec![
-                                channel.to_owned(),
-                                bridge.topic.clone(),
+                                chan,
+                                topic,
                             ])).await?;
                         } else {
                             framed.send(num(server, Response::ERR_NOSUCHCHANNEL, nick, vec![
@@ -247,6 +333,27 @@ async fn relay_loop(
                                 "No such channel".to_owned(),
                             ])).await?;
                         }
+                    }
+                    Command::LIST(chans, _) => {
+                        framed.send(num(server, Response::RPL_LISTSTART, nick, vec!["Channel :Users  Name".to_owned()])).await?;
+                        let entries = bridge.entries();
+                        let wanted: Vec<String> = chans
+                            .map(|c| c.split(',').map(str::to_owned).collect())
+                            .unwrap_or_default();
+                        for e in &entries {
+                            if !wanted.is_empty()
+                                && !wanted.iter().any(|w| w.eq_ignore_ascii_case(&e.channel))
+                            {
+                                continue;
+                            }
+                            let members = bridge.channel_members(&e.channel).await.unwrap_or_default().len();
+                            framed.send(num(server, Response::RPL_LIST, nick, vec![
+                                e.channel.clone(),
+                                members.to_string(),
+                                e.topic.clone(),
+                            ])).await?;
+                        }
+                        framed.send(num(server, Response::RPL_LISTEND, nick, vec!["End of /LIST".to_owned()])).await?;
                     }
                     Command::UserMODE(target, _) => {
                         if target == *nick {
@@ -258,9 +365,9 @@ async fn relay_loop(
                         }
                     }
                     Command::ChannelMODE(chan, _) => {
-                        if chan.eq_ignore_ascii_case(channel) {
+                        if known_channel(&chan) {
                             framed.send(num(server, Response::RPL_CHANNELMODEIS, nick, vec![
-                                channel.to_owned(),
+                                chan,
                                 "+nt".to_owned(),
                             ])).await?;
                         } else {
@@ -350,7 +457,8 @@ async fn matrix_auth(
     framed: &mut Framed<TcpStream, IrcCodec>,
     cfg: &Arc<Config>,
     reg: &Registration,
-) -> Result<Option<Bridge>> {
+    media: &Arc<crate::media::MediaServer>,
+) -> Result<Option<Arc<Bridge>>> {
     let server = &cfg.server_name;
     let nick = reg.nick.clone().unwrap_or_default();
 
@@ -368,9 +476,10 @@ async fn matrix_auth(
         Some(u) if u.contains('@') && u.contains(':') => u.clone(),
         _ => nick.clone(),
     };
+    let hs = gecos_homeserver(reg.realname.as_deref());
 
-    tracing::info!(nick = %nick, "authenticating against matrix");
-    let connect = Bridge::connect(cfg, &nick, &pass, &login_user);
+    tracing::info!(nick = %nick, homeserver = ?hs, "authenticating against matrix");
+    let connect = Bridge::connect(cfg, &nick, &pass, &login_user, hs.as_deref(), Arc::clone(media));
     match tokio::time::timeout(std::time::Duration::from_secs(120), connect).await {
         Ok(Ok(bridge)) => Ok(Some(bridge)),
         Ok(Err(e)) => {
@@ -470,27 +579,70 @@ async fn send_join(
     server: &str,
     prefix: &Prefix,
     nick: &str,
-    bridge: &Bridge,
+    entry: &crate::bridge::rooms::RoomEntry,
+    bridge: &Arc<Bridge>,
+    names_limit: usize,
 ) -> Result<()> {
-    let channel = &bridge.channel;
+    let channel = entry.channel.clone();
     // JOIN is always emitted before any PRIVMSG on that channel
     framed.send(from_client(prefix, Command::JOIN(channel.clone(), None, None))).await?;
     framed.send(num(server, Response::RPL_TOPIC, nick, vec![
         channel.clone(),
-        bridge.topic.clone(),
+        entry.topic.clone(),
     ])).await?;
-    let mut members = bridge.members.clone();
+    send_names(framed, server, nick, &channel, bridge, names_limit).await?;
+    Ok(())
+}
+
+/// Send 353/366 for a channel, capped and chunked to keep huge rooms
+/// from freezing IRC clients.
+async fn send_names(
+    framed: &mut Framed<TcpStream, IrcCodec>,
+    server: &str,
+    nick: &str,
+    channel: &str,
+    bridge: &Arc<Bridge>,
+    names_limit: usize,
+) -> Result<()> {
+    let mut members = bridge.channel_members(channel).await.unwrap_or_default();
     if !members.iter().any(|m| m.eq_ignore_ascii_case(nick)) {
         members.push(nick.to_owned());
     }
-    framed.send(num(server, Response::RPL_NAMREPLY, nick, vec![
-        "=".to_owned(),
-        channel.clone(),
-        members.join(" "),
-    ])).await?;
+    let truncated = members.len() > names_limit;
+    if truncated {
+        members.truncate(names_limit);
+    }
+    // chunk so each 353 stays under the ~510-byte IRC line limit
+    let mut line: Vec<String> = Vec::new();
+    let mut len = 0usize;
+    for m in members {
+        if len + m.len() + 1 > 350 && !line.is_empty() {
+            framed.send(num(server, Response::RPL_NAMREPLY, nick, vec![
+                "=".to_owned(),
+                channel.to_owned(),
+                line.join(" "),
+            ])).await?;
+            line.clear();
+            len = 0;
+        }
+        len += m.len() + 1;
+        line.push(m);
+    }
+    if !line.is_empty() {
+        framed.send(num(server, Response::RPL_NAMREPLY, nick, vec![
+            "=".to_owned(),
+            channel.to_owned(),
+            line.join(" "),
+        ])).await?;
+    }
+    let end = if truncated {
+        format!("End of /NAMES list (truncated to {names_limit})")
+    } else {
+        "End of /NAMES list".to_owned()
+    };
     framed.send(num(server, Response::RPL_ENDOFNAMES, nick, vec![
-        channel.clone(),
-        "End of /NAMES list".to_owned(),
+        channel.to_owned(),
+        end,
     ])).await?;
     Ok(())
 }
@@ -500,9 +652,11 @@ async fn send_who(
     server: &str,
     nick: &str,
     channel: &str,
-    members: &[String],
+    bridge: &Arc<Bridge>,
+    names_limit: usize,
 ) -> Result<()> {
-    for member in members {
+    let members = bridge.channel_members(channel).await.unwrap_or_default();
+    for member in members.iter().take(names_limit) {
         framed.send(num(server, Response::RPL_WHOREPLY, nick, vec![
             channel.to_owned(),
             member.clone(),
@@ -521,34 +675,29 @@ async fn send_who(
 }
 
 async fn relay_from_irc(
-    framed: &mut Framed<TcpStream, IrcCodec>,
-    bridge: &Bridge,
-    server: &str,
+    bridge: &Arc<Bridge>,
     nick: &str,
     target: &str,
     body: String,
     notice: bool,
+    known: bool,
     joined: bool,
 ) -> Result<()> {
-    if !target.eq_ignore_ascii_case(&bridge.channel) {
-        framed.send(num(server, Response::ERR_NOSUCHNICK, nick, vec![
-            target.to_owned(),
-            "No such nick/channel".to_owned(),
-        ])).await?;
+    if !known {
         return Ok(());
     }
     if !joined {
-        framed.send(num(server, Response::ERR_NOTONCHANNEL, nick, vec![
-            target.to_owned(),
-            "You're not on that channel".to_owned(),
-        ])).await?;
+        // don't error hard; matrix side just doesn't see it (avoids the
+        // goguma "not joined in channel" send-failure loop)
+        tracing::debug!(nick, channel = %target, "dropping message to parted channel");
         return Ok(());
     }
     // send in the background so a slow homeserver can't stall IRC reads
-    let bridge = bridge.clone();
+    let bridge = Arc::clone(bridge);
+    let target = target.to_owned();
     tokio::spawn(async move {
-        if let Err(e) = bridge.send_from_irc(body, notice).await {
-            tracing::warn!(error = %e, "matrix send failed");
+        if let Err(e) = bridge.send_from_irc(&target, body, notice).await {
+            tracing::warn!(channel = %target, error = %e, "matrix send failed");
         }
     });
     Ok(())

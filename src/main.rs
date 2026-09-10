@@ -7,6 +7,7 @@ mod bridge;
 mod config;
 mod ircd;
 mod matrix;
+mod media;
 mod state;
 
 use config::Config;
@@ -30,6 +31,10 @@ struct Args {
     /// Override the listen address
     #[arg(long)]
     listen: Option<SocketAddr>,
+
+    /// Override the local media server listen address
+    #[arg(long)]
+    media_listen: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -72,6 +77,9 @@ fn load_config(args: &Args) -> anyhow::Result<Config> {
     }
     if let Some(listen) = args.listen {
         cfg.listen = listen;
+    }
+    if let Some(media_listen) = args.media_listen {
+        cfg.media_listen = media_listen;
     }
     Ok(cfg)
 }

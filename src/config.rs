@@ -14,33 +14,36 @@ use serde::Deserialize;
 pub struct Config {
     /// Address the IRCd listens on.
     pub listen: SocketAddr,
+    /// Address the local media HTTP server listens on.
+    pub media_listen: SocketAddr,
     /// IRC server name shown in numerics and prefixes.
     pub server_name: String,
     /// Directory for persistent (encrypted) sessions and matrix-sdk state.
     pub state_dir: PathBuf,
-    /// Homeserver base URL; required for the first login of a user,
-    /// afterwards taken from the stored session unless overridden.
+    /// Homeserver base URL; used when not given via GECOS in USER.
+    /// Required for the first login of a user, afterwards taken from the
+    /// stored session unless overridden.
     pub homeserver: Option<String>,
     /// Allow creating new Matrix sessions from IRC PASS/NICK/USER registration.
     pub allow_register: bool,
-    /// M0 single-room relay settings.
+    /// Room↔channel relay tuning.
     pub bridge: BridgeConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BridgeConfig {
-    /// Matrix room to relay: room id (`!…`) or alias (`#…:…`).
-    /// Defaults to the first joined room.
-    pub room: Option<String>,
-    /// IRC channel name for the relayed room. Defaults to `#matrix`.
-    pub channel: String,
+    /// Maximum number of nicks sent in NAMES/353 and WHO/352 replies.
+    /// Huge Matrix rooms (thousands of members) freeze IRC clients if the
+    /// full list is sent, so it is capped.
+    pub names_limit: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([127, 0, 0, 1], 2078)),
+            media_listen: SocketAddr::from(([127, 0, 0, 1], 2079)),
             server_name: "matrix2078".to_owned(),
             state_dir: PathBuf::from("./state"),
             homeserver: None,
@@ -52,7 +55,7 @@ impl Default for Config {
 
 impl Default for BridgeConfig {
     fn default() -> Self {
-        Self { room: None, channel: "#matrix".to_owned() }
+        Self { names_limit: 200 }
     }
 }
 
@@ -83,6 +86,9 @@ impl Config {
         if let Some(v) = env_parse::<SocketAddr>("MATRIX2078_LISTEN") {
             self.listen = v;
         }
+        if let Some(v) = env_parse::<SocketAddr>("MATRIX2078_MEDIA_LISTEN") {
+            self.media_listen = v;
+        }
         if let Some(v) = env_str("MATRIX2078_SERVER_NAME") {
             self.server_name = v;
         }
@@ -95,11 +101,8 @@ impl Config {
         if let Some(v) = env_parse::<bool>("MATRIX2078_ALLOW_REGISTER") {
             self.allow_register = v;
         }
-        if let Some(v) = env_str("MATRIX2078_BRIDGE_ROOM") {
-            self.bridge.room = Some(v);
-        }
-        if let Some(v) = env_str("MATRIX2078_BRIDGE_CHANNEL") {
-            self.bridge.channel = v;
+        if let Some(v) = env_parse::<usize>("MATRIX2078_NAMES_LIMIT") {
+            self.bridge.names_limit = v;
         }
     }
 }
@@ -127,9 +130,10 @@ mod tests {
     fn defaults() {
         let cfg = Config::default();
         assert_eq!(cfg.listen.to_string(), "127.0.0.1:2078");
+        assert_eq!(cfg.media_listen.to_string(), "127.0.0.1:2079");
         assert_eq!(cfg.state_dir, PathBuf::from("./state"));
         assert!(!cfg.allow_register);
-        assert_eq!(cfg.bridge.channel, "#matrix");
+        assert_eq!(cfg.bridge.names_limit, 200);
     }
 
     #[test]
@@ -140,20 +144,17 @@ mod tests {
             state_dir = "./st"
             homeserver = "https://example.org"
             [bridge]
-            room = "!abc:example.org"
-            channel = "#test"
+            names_limit = 50
             "##,
         )
         .unwrap();
         assert_eq!(cfg.listen.to_string(), "127.0.0.1:6667");
         assert_eq!(cfg.homeserver.as_deref(), Some("https://example.org"));
-        assert_eq!(cfg.bridge.room.as_deref(), Some("!abc:example.org"));
-        assert_eq!(cfg.bridge.channel, "#test");
+        assert_eq!(cfg.bridge.names_limit, 50);
     }
 
     #[test]
     fn env_overrides() {
-        // unique key values to avoid clashing with parallel tests
         std::env::set_var("MATRIX2078_TEST_LISTEN", "127.0.0.1:6697");
         let listen: SocketAddr =
             env_parse("MATRIX2078_TEST_LISTEN").expect("should parse socket addr");
@@ -161,6 +162,9 @@ mod tests {
 
         std::env::set_var("MATRIX2078_TEST_BOOL", "true");
         assert_eq!(env_parse::<bool>("MATRIX2078_TEST_BOOL"), Some(true));
+
+        std::env::set_var("MATRIX2078_TEST_NUM", "42");
+        assert_eq!(env_parse::<usize>("MATRIX2078_TEST_NUM"), Some(42));
 
         std::env::set_var("MATRIX2078_TEST_JUNK", "not-a-port");
         assert_eq!(env_parse::<SocketAddr>("MATRIX2078_TEST_JUNK"), None);

@@ -1,8 +1,14 @@
 # matrix2078 sample configuration.
 # Every field can be overridden with MATRIX2078_* env vars (see README).
+# Note: no homeserver/room config is required — homeserver can come from the
+# IRC realname (GECOS) field and all joined rooms are bridged automatically.
 
 # IRC listen address. Default: 127.0.0.1:2078
 listen = "127.0.0.1:2078"
+
+# Local media server (serves authenticated downloads at stable URLs).
+# Default: 127.0.0.1:2079
+media_listen = "127.0.0.1:2079"
 
 # IRC network/server name shown to clients.
 server_name = "matrix2078"
@@ -10,18 +16,15 @@ server_name = "matrix2078"
 # Where encrypted sessions and matrix-sdk state live. Gitignored.
 state_dir = "./state"
 
-# Homeserver base URL. Required for the first login of a user;
-# afterwards taken from the stored session unless overridden here.
-homeserver = "https://matrix.doesnmlab.xyz"
+# Homeserver base URL. Optional: the IRC realname (GECOS) field takes
+# priority, then this, then the stored session's homeserver.
+# homeserver = "https://matrix.doesnmlab.xyz"
 
 # Allow creating new Matrix sessions from IRC registration.
 # Equivalent to the --allow-register CLI flag.
 allow_register = false
 
 [bridge]
-# M0: the single relayed room. Room id or alias; omit to relay the first
-# joined room.
-room = "#m2078-plain:doesnmlab.xyz"
-# IRC channel name for the room. Default: "#matrix", or derived from the
-# alias localpart.
-channel = "#m2078-plain"
+# Maximum nicks sent in NAMES/353 and WHO/352 replies. Huge Matrix rooms
+# (thousands of members) freeze IRC clients if sent in full.
+names_limit = 200

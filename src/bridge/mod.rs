@@ -1,54 +1,64 @@
-//! M0 bridge: one Matrix room ⇄ one IRC channel, both directions.
+//! Bridge: all joined Matrix rooms ⇄ stable IRC channels, both directions.
 
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use irc::proto::{Command, Message};
 use matrix_sdk::{
     Client, Room, RoomState,
     config::SyncSettings,
     ruma::{
         OwnedRoomId,
-        events::room::message::{MessageType, RoomMessageEventContent, SyncRoomMessageEvent},
+        events::room::{
+            MediaSource,
+            message::{MessageType, RoomMessageEventContent, SyncRoomMessageEvent},
+            name::SyncRoomNameEvent,
+            topic::SyncRoomTopicEvent,
+        },
     },
 };
 use tokio::sync::mpsc;
 
 use crate::{
+    bridge::rooms::{RoomEntry, RoomMaps},
     config::Config,
     ircd::proto,
     matrix::client::login_or_restore,
+    media::MediaServer,
 };
 
-#[derive(Clone)]
+pub mod rooms;
+
+/// Shared per-user bridge state visible to event handlers.
 pub struct Bridge {
     pub client: Client,
-    pub room: Room,
-    pub room_id: OwnedRoomId,
-    /// IRC channel name (stable, `#…`).
-    pub channel: String,
-    /// Topic shown to the IRC client (room topic or name).
-    pub topic: String,
-    /// Nicks present in the room (M0: mxid localparts).
-    pub members: Vec<String>,
-    /// Our own Matrix user id, to skip echoes of our own sends.
     pub own_mxid: matrix_sdk::ruma::OwnedUserId,
+    pub rooms: Arc<Mutex<RoomMaps>>,
+    /// IRC channels the client currently occupies (lowercase).
+    pub joined: Arc<Mutex<HashSet<String>>>,
+    pub cfg: Arc<Config>,
+    pub media: Arc<MediaServer>,
 }
 
 impl Bridge {
-    /// Log in / restore the Matrix session and do the initial sync.
+    /// Log in / restore the Matrix session, do the initial sync and build
+    /// the room→channel mapping for every joined (non-space) room.
     pub async fn connect(
         cfg: &Arc<Config>,
         nick: &str,
         irc_pass: &str,
         login_user: &str,
-    ) -> Result<Self> {
-        let client = login_or_restore(cfg, nick, irc_pass, login_user).await?;
+        hs_override: Option<&str>,
+        media: Arc<MediaServer>,
+    ) -> Result<Arc<Self>> {
+        let client = login_or_restore(cfg, nick, irc_pass, login_user, hs_override).await?;
 
         client
-            .sync_once(
-                SyncSettings::default().ignore_timeout_on_first_sync(true),
-            )
+            .sync_once(SyncSettings::default().ignore_timeout_on_first_sync(true))
             .await
             .context("initial matrix sync failed")?;
         let own_mxid = client
@@ -56,105 +66,209 @@ impl Bridge {
             .map(|u| u.to_owned())
             .ok_or_else(|| anyhow::anyhow!("client has no user id after sync"))?;
 
-        let (room, channel) = Self::pick_room(&client, cfg).await?;
-        let room_id = room.room_id().to_owned();
-        let topic = Self::room_topic(&room, &channel);
-        let members = Self::member_nicks(&room).await;
-
-        Ok(Self { client, room, room_id, channel, topic, members, own_mxid })
-    }
-
-    async fn pick_room(client: &Client, cfg: &Config) -> Result<(Room, String)> {
-        match cfg.bridge.room.as_deref() {
-            Some(spec) => {
-                let room_id = if let Some(id) = spec.strip_prefix('!') {
-                    matrix_sdk::ruma::OwnedRoomId::try_from(format!("!{id}"))
-                        .map_err(|e| anyhow::anyhow!("bad room id {spec:?}: {e}"))?
-                } else if let Some(alias) = spec.strip_prefix('#') {
-                    let alias = matrix_sdk::ruma::OwnedRoomAliasId::try_from(format!("#{alias}"))
-                        .map_err(|e| anyhow::anyhow!("bad room alias {spec:?}: {e}"))?;
-                    let resolved = client
-                        .resolve_room_alias(&alias)
-                        .await
-                        .with_context(|| format!("resolving alias {spec}"))?;
-                    resolved.room_id
-                } else {
-                    bail!("bridge.room must be a room id (!…) or alias (#…), got {spec:?}")
-                };
-                let room = client
-                    .get_room(&room_id)
-                    .ok_or_else(|| anyhow::anyhow!("we are not in room {room_id}"))?;
-                let channel = default_channel_for(cfg, spec);
-                Ok((room, channel))
+        let maps_path = channels_path(&cfg.state_dir, nick);
+        let mut maps = RoomMaps::load(maps_path);
+        let live: HashSet<OwnedRoomId> =
+            client.joined_rooms().iter().map(|r| r.room_id().to_owned()).collect();
+        maps.prune_to(&live);
+        for room in client.joined_rooms() {
+            if room.is_space() {
+                continue;
             }
-            None => {
-                let room = client
-                    .joined_rooms()
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("no joined rooms to relay"))?;
-                Ok((room, cfg.bridge.channel.clone()))
-            }
+            let (base, topic) = Self::room_label(&room).await;
+            maps.ensure(room.room_id().to_owned(), &base, topic);
         }
+
+        Ok(Arc::new(Self {
+            client: client.clone(),
+            own_mxid,
+            rooms: Arc::new(Mutex::new(maps)),
+            joined: Arc::new(Mutex::new(HashSet::new())),
+            cfg: cfg.clone(),
+            media,
+        }))
     }
 
-    fn room_topic(room: &Room, channel: &str) -> String {
-        let base = if let Some(t) = room.topic().filter(|t| !t.is_empty()) {
-            t
-        } else if let Some(name) = room.name().filter(|n| !n.is_empty()) {
-            name
-        } else {
-            format!("Matrix room {}", room.room_id())
+    /// Preferred channel base (without `#`) and topic for a room.
+    async fn room_label(room: &Room) -> (String, String) {
+        let alias = room.canonical_alias().map(|a| {
+            a.alias()
+                .trim_start_matches('#')
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .to_owned()
+        }).filter(|l| !l.is_empty());
+        let base = match alias {
+            Some(a) => a,
+            None => match room.name().filter(|n| !n.is_empty()) {
+                Some(n) => n,
+                None => room
+                    .display_name()
+                    .await
+                    .ok()
+                    .and_then(display_string)
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or_else(|| room.room_id().to_string()),
+            },
         };
-        format!("{} [{}]", base.replace('\n', " | ").replace('\r', ""), channel)
+        let topic = room
+            .topic()
+            .filter(|t| !t.is_empty())
+            .or_else(|| room.name().filter(|n| !n.is_empty()))
+            .unwrap_or_else(|| format!("Matrix room {}", room.room_id()));
+        (base, topic.replace('\n', " | ").replace('\r', ""))
     }
 
-    async fn member_nicks(room: &Room) -> Vec<String> {
-        match room.members(matrix_sdk::RoomMemberships::JOIN).await {
-            Ok(members) => members
+    /// Members of the room mapped to `channel`, as IRC nicks.
+    pub async fn channel_members(&self, channel: &str) -> Option<Vec<String>> {
+        let room_id = {
+            let maps = self.rooms.lock().expect("rooms mutex");
+            maps.get_by_channel(channel).map(|e| e.room_id.clone())
+        }?;
+        let room = self.client.get_room(&room_id)?;
+        let members = room
+            .members(matrix_sdk::RoomMemberships::JOIN)
+            .await
+            .unwrap_or_default();
+        Some(
+            members
                 .iter()
                 .map(|m| proto::mxid_to_nick(m.user_id().as_str()))
                 .collect(),
-            Err(e) => {
-                tracing::warn!(error = %e, "listing room members failed");
-                Vec::new()
-            }
-        }
+        )
     }
 
-    /// Subscribe to room messages; relayed lines are pushed into `tx`.
+    /// Register event handlers pushing relayed IRC lines into `tx`.
     pub fn relay_matrix_to_irc(&self, tx: mpsc::Sender<Message>) {
-        let room_id = self.room_id.clone();
-        let channel = self.channel.clone();
+        self.message_handler(tx.clone());
+        self.topic_handler(tx);
+    }
+
+    fn message_handler(&self, tx: mpsc::Sender<Message>) {
+        let rooms = Arc::clone(&self.rooms);
+        let joined = Arc::clone(&self.joined);
         let own = self.own_mxid.clone();
-        self.client.add_event_handler(move |ev: SyncRoomMessageEvent, room: Room| {
-            let tx = tx.clone();
-            async move {
-                let matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(ev) = ev else {
-                    return;
-                };
-                if room.room_id() != &room_id || room.state() != RoomState::Joined {
-                    return;
+        let cfg = Arc::clone(&self.cfg);
+        let media = Arc::clone(&self.media);
+        self.client.add_event_handler(
+            move |ev: SyncRoomMessageEvent, room: Room, client: Client| {
+                let tx = tx.clone();
+                let rooms = Arc::clone(&rooms);
+                let joined = Arc::clone(&joined);
+                let own = own.clone();
+                let cfg = Arc::clone(&cfg);
+                let media = Arc::clone(&media);
+                async move {
+                    let matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(ev) = ev else {
+                        return;
+                    };
+                    // edits arrive as separate m.replace events; skip them for now
+                    if let Some(rel) = &ev.content.relates_to {
+                        if rel.rel_type()
+                            == Some(matrix_sdk::ruma::events::relation::RelationType::Replacement)
+                        {
+                            return;
+                        }
+                    }
+                    if room.state() != RoomState::Joined {
+                        return;
+                    }
+                    let sender = ev.sender.clone();
+                    if sender == own {
+                        return;
+                    }
+
+                    // find or create the room mapping
+                    let entry = {
+                        let maps = rooms.lock().expect("rooms mutex");
+                        maps.get_by_room(room.room_id()).cloned()
+                    };
+                    let entry = match entry {
+                        Some(e) => e,
+                        None => {
+                            let (base, topic) = Bridge::room_label(&room).await;
+                            let mut maps = rooms.lock().expect("rooms mutex");
+                            maps.ensure(room.room_id().to_owned(), &base, topic).clone()
+                        }
+                    };
+                    let channel = entry.channel.clone();
+
+                    let body = match render_body(&ev.content.msgtype, &client, &media, &cfg).await
+                    {
+                        Some(b) => b,
+                        None => return,
+                    };
+
+                    // JOIN must always be emitted before any PRIVMSG on a channel
+                    let need_join = {
+                        let mut j = joined.lock().expect("joined mutex");
+                        let lower = channel.to_ascii_lowercase();
+                        if j.contains(&lower) {
+                            false
+                        } else {
+                            j.insert(lower);
+                            true
+                        }
+                    };
+                    let nick = proto::mxid_to_nick(sender.as_str());
+                    if need_join {
+                        let _ = tx
+                            .send(proto::user(&nick, Command::JOIN(channel.clone(), None, None)))
+                            .await;
+                        let _ = tx
+                            .send(proto::srv(
+                                &cfg.server_name,
+                                Command::Response(
+                                    irc::proto::Response::RPL_TOPIC,
+                                    vec!["*".into(), channel.clone(), entry.topic.clone()],
+                                ),
+                            ))
+                            .await;
+                    }
+
+                    let cmd = match &ev.content.msgtype {
+                        MessageType::Emote(_) => {
+                            Command::PRIVMSG(channel, format!("\u{1}ACTION {body}\u{1}"))
+                        }
+                        MessageType::Notice(_) => Command::NOTICE(channel, body),
+                        _ => Command::PRIVMSG(channel, body),
+                    };
+                    let _ = tx.send(proto::user(&nick, cmd)).await;
                 }
-                if ev.sender == own {
-                    return;
+            },
+        );
+    }
+
+    fn topic_handler(&self, tx: mpsc::Sender<Message>) {
+        let tx_topic = tx.clone();
+        let rooms_topic = Arc::clone(&self.rooms);
+
+        self.client.add_event_handler(
+            move |ev: SyncRoomTopicEvent, room: Room| {
+                let mut tx = tx_topic.clone();
+                let rooms = Arc::clone(&rooms_topic);
+                async move {
+                    let matrix_sdk::ruma::events::SyncStateEvent::Original(ev) = ev else {
+                        return;
+                    };
+                    push_topic(&mut tx, &rooms, &room, ev.content.topic).await;
                 }
-                let (body, notice) = match ev.content.msgtype {
-                    MessageType::Text(t) => (t.body, false),
-                    MessageType::Notice(t) => (t.body, true),
-                    _ => return,
-                };
-                let nick = proto::mxid_to_nick(ev.sender.as_str());
-                let cmd = if notice {
-                    Command::NOTICE(channel.clone(), body)
-                } else {
-                    Command::PRIVMSG(channel.clone(), body)
-                };
-                if let Err(e) = tx.send(proto::user(&nick, cmd)).await {
-                    tracing::warn!(error = %e, "irc side went away");
+            },
+        );
+        let rooms2 = Arc::clone(&self.rooms);
+        self.client.add_event_handler(
+            move |ev: SyncRoomNameEvent, room: Room| {
+                let mut tx = tx.clone();
+                let rooms = Arc::clone(&rooms2);
+                async move {
+                    let matrix_sdk::ruma::events::SyncStateEvent::Original(ev) = ev else {
+                        return;
+                    };
+                    push_topic(&mut tx, &rooms, &room, ev.content.name).await;
                 }
-            }
-        });
+            },
+        );
     }
 
     /// Keep the sync loop running in the background. The returned handle
@@ -164,20 +278,62 @@ impl Bridge {
         tokio::spawn(sync_forever(client))
     }
 
-    /// Deliver an IRC line to Matrix (text or notice).
-    pub async fn send_from_irc(&self, body: String, notice: bool) -> Result<()> {
+    /// Deliver an IRC line to the mapped Matrix room.
+    pub async fn send_from_irc(&self, channel: &str, body: String, notice: bool) -> Result<()> {
+        let room_id = {
+            let maps = self.rooms.lock().expect("rooms mutex");
+            maps.get_by_channel(channel).map(|e| e.room_id.clone())
+        };
+        let Some(room_id) = room_id else {
+            anyhow::bail!("no room mapped for channel {channel}");
+        };
+        let Some(room) = self.client.get_room(&room_id) else {
+            anyhow::bail!("lost room {}", room_id.as_str());
+        };
         let content = if notice {
             RoomMessageEventContent::notice_plain(body)
         } else {
             RoomMessageEventContent::text_plain(body)
         };
-        self.room
-            .send(content)
+        room.send(content)
             .await
             .map(|_| ())
             .context("sending message to matrix room")?;
         Ok(())
     }
+
+    /// Snapshot of mapped rooms for the initial JOIN burst.
+    pub fn entries(&self) -> Vec<RoomEntry> {
+        self.rooms.lock().expect("rooms mutex").entries().to_vec()
+    }
+
+    pub fn media_dir(&self) -> PathBuf {
+        crate::matrix::media::cache_dir(&self.cfg.state_dir)
+    }
+}
+
+async fn push_topic(
+    tx: &mut mpsc::Sender<Message>,
+    rooms: &Arc<Mutex<RoomMaps>>,
+    room: &Room,
+    new: String,
+) {
+    // Room name/topic changes surface as TOPIC, never as a channel rename.
+    let entry = {
+        let maps = rooms.lock().expect("rooms mutex");
+        maps.get_by_room(room.room_id()).cloned()
+    };
+    let Some(entry) = entry else { return };
+    let topic = new.replace('\n', " | ").replace('\r', "");
+    {
+        let mut maps = rooms.lock().expect("rooms mutex");
+        if let Some(e) = maps.get_by_room_mut(room.room_id()) {
+            e.topic = topic.clone();
+        }
+    }
+    let _ = tx
+        .send(proto::user("matrix", Command::TOPIC(entry.channel, Some(topic))))
+        .await;
 }
 
 async fn sync_forever(client: Client) {
@@ -190,19 +346,169 @@ async fn sync_forever(client: Client) {
     }
 }
 
-fn default_channel_for(cfg: &Config, spec: &str) -> String {
-    if cfg.bridge.channel != "#matrix" {
-        return cfg.bridge.channel.clone();
+fn channels_path(state_dir: &Path, nick: &str) -> PathBuf {
+    crate::matrix::client::user_dir(state_dir, nick).join("channels.json")
+}
+
+/// Extract the string from a computed room display name.
+fn display_string(d: matrix_sdk::RoomDisplayName) -> Option<String> {
+    use matrix_sdk::RoomDisplayName::*;
+    match d {
+        Named(s) | Aliased(s) | Calculated(s) | EmptyWas(s) => Some(s),
+        Empty => None,
     }
-    // default: derive from alias localpart
-    if let Some(rest) = spec.strip_prefix('#') {
-        let local = rest.split(':').next().unwrap_or("matrix");
-        let clean: String = local
-            .chars()
-            .map(|c| if c.is_alphanumeric() || "._-".contains(c) { c } else { '_' })
-            .collect();
-        format!("#{}", clean)
+}
+
+/// Render a Matrix msgtype into an IRC message body.
+/// Text/emote/notice pass through (with mxc links localized); attachments
+/// become a one-liner pointing at the local authenticated-media cache.
+async fn render_body(
+    msgtype: &MessageType,
+    client: &Client,
+    media: &Arc<MediaServer>,
+    cfg: &Arc<Config>,
+) -> Option<String> {
+    match msgtype {
+        MessageType::Text(c) => Some(localize_mxc(&c.body, client, media, cfg).await),
+        MessageType::Notice(c) => Some(localize_mxc(&c.body, client, media, cfg).await),
+        MessageType::Emote(c) => Some(localize_mxc(&c.body, client, media, cfg).await),
+        MessageType::Image(c) => Some(
+            attachment_line(
+                "image",
+                &c.body,
+                c.filename.as_deref(),
+                &c.source,
+                c.info.as_deref().and_then(|i| i.mimetype.as_deref()),
+                c.info.as_deref().and_then(|i| i.size).and_then(|s| u64::try_from(s).ok()),
+                client,
+                media,
+                cfg,
+            )
+            .await,
+        ),
+        MessageType::File(c) => Some(
+            attachment_line(
+                "file",
+                &c.body,
+                Some(c.filename()),
+                &c.source,
+                c.info.as_deref().and_then(|i| i.mimetype.as_deref()),
+                c.info.as_deref().and_then(|i| i.size).and_then(|s| u64::try_from(s).ok()),
+                client,
+                media,
+                cfg,
+            )
+            .await,
+        ),
+        MessageType::Audio(c) => Some(
+            attachment_line(
+                "audio",
+                &c.body,
+                c.filename.as_deref(),
+                &c.source,
+                c.info.as_deref().and_then(|i| i.mimetype.as_deref()),
+                c.info.as_deref().and_then(|i| i.size).and_then(|s| u64::try_from(s).ok()),
+                client,
+                media,
+                cfg,
+            )
+            .await,
+        ),
+        MessageType::Video(c) => Some(
+            attachment_line(
+                "video",
+                &c.body,
+                c.filename.as_deref(),
+                &c.source,
+                c.info.as_deref().and_then(|i| i.mimetype.as_deref()),
+                c.info.as_deref().and_then(|i| i.size).and_then(|s| u64::try_from(s).ok()),
+                client,
+                media,
+                cfg,
+            )
+            .await,
+        ),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn attachment_line(
+    kind: &str,
+    body: &str,
+    filename: Option<&str>,
+    source: &MediaSource,
+    mime: Option<&str>,
+    size: Option<u64>,
+    client: &Client,
+    media: &Arc<MediaServer>,
+    cfg: &Arc<Config>,
+) -> String {
+    let name = filename.filter(|n| !n.is_empty()).unwrap_or(body);
+    let size_str = size.map(|s| format!(" ({})", human_size(s))).unwrap_or_default();
+    let dir = crate::matrix::media::cache_dir(&cfg.state_dir);
+    let url = match crate::matrix::media::fetch_to_cache(client, &dir, source, mime).await {
+        Ok(path) => {
+            let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+            media.url_for(file)
+        }
+        Err(e) => format!("<media unavailable: {e:#}>"),
+    };
+    format!("[{kind}] {name}{size_str} — {url}")
+}
+
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
-        "#matrix".to_owned()
+        format!("{bytes} B")
     }
+}
+
+/// Replace `mxc://` URIs in a text body with local media-cache URLs.
+async fn localize_mxc(
+    body: &str,
+    client: &Client,
+    media: &Arc<MediaServer>,
+    cfg: &Arc<Config>,
+) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"mxc://([A-Za-z0-9.\-]+)/([A-Za-z0-9_\-=]+)").expect("mxc regex")
+    });
+
+    let mut out = String::with_capacity(body.len());
+    let mut last = 0;
+    let dir = crate::matrix::media::cache_dir(&cfg.state_dir);
+    for m in re.captures_iter(body) {
+        let whole = m.get(0).expect("group 0");
+        let server = m.get(1).expect("server").as_str();
+        let id = m.get(2).expect("id").as_str();
+        out.push_str(&body[last..whole.start()]);
+        let source = matrix_sdk::ruma::OwnedMxcUri::try_from(format!("mxc://{server}/{id}"))
+            .ok()
+            .map(matrix_sdk::ruma::events::room::MediaSource::Plain);
+        let source = match source {
+            Some(s) => s,
+            None => {
+                out.push_str(whole.as_str());
+                last = whole.end();
+                continue;
+            }
+        };
+        match crate::matrix::media::fetch_to_cache(client, &dir, &source, None).await {
+            Ok(path) => {
+                let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+                out.push_str(&media.url_for(file));
+            }
+            Err(_) => out.push_str(whole.as_str()),
+        }
+        last = whole.end();
+    }
+    out.push_str(&body[last..]);
+    out
 }
