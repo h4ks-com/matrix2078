@@ -393,6 +393,16 @@ struct MultiLine {
     target: String,
     notice: bool,
     lines: Vec<String>,
+    reply: Option<String>,
+}
+
+/// Value of an incoming client tag, if present.
+fn tag_value(msg: &Message, name: &str) -> Option<String> {
+    msg.tags
+        .as_ref()?
+        .iter()
+        .find(|t| t.0 == name)
+        .and_then(|t| t.1.clone())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -448,6 +458,8 @@ async fn relay_loop(
                                     if ml.target.is_empty() {
                                         ml.target = target.clone();
                                     }
+                                    // reply tag of the first line applies to the whole batch
+                                    ml.reply = tag_value(&msg, "+draft/reply");
                                 }
                                 ml.lines.push(body.clone());
                                 continue;
@@ -456,6 +468,7 @@ async fn relay_loop(
                         _ => {}
                     }
                 }
+                let reply_tag = tag_value(&msg, "+draft/reply");
                 match msg.command {
                     Command::PING(token, _) => {
                         framed.send(srv(server, Command::PONG(server.to_owned(), Some(token)))).await?;
@@ -465,14 +478,40 @@ async fn relay_loop(
                         if target.eq_ignore_ascii_case(crate::matrix::verification::CONTROL_NICK) {
                             control_command(framed, caps, server, nick, bridge, &body).await?;
                         } else {
-                            relay_from_irc(bridge, nick, &prefix, &target, body, false, known_channel(&target), is_joined(&target), caps, &echo_tx).await?;
+                            relay_from_irc(bridge, nick, &prefix, &target, body, false, known_channel(&target), is_joined(&target), caps, &echo_tx, reply_tag).await?;
                         }
                     }
                     Command::NOTICE(target, body) => {
                         if target.eq_ignore_ascii_case(crate::matrix::verification::CONTROL_NICK) {
                             control_command(framed, caps, server, nick, bridge, &body).await?;
                         } else {
-                            relay_from_irc(bridge, nick, &prefix, &target, body, true, known_channel(&target), is_joined(&target), caps, &echo_tx).await?;
+                            relay_from_irc(bridge, nick, &prefix, &target, body, true, known_channel(&target), is_joined(&target), caps, &echo_tx, reply_tag).await?;
+                        }
+                    }
+                    Command::Raw(ref cmd, ref params) if cmd == "TAGMSG" => {
+                        // +draft/reply + +draft/react => m.reaction
+                        if caps.has("message-tags") {
+                            if let Some(target) = params.first() {
+                                if known_channel(target) {
+                                    let react = tag_value(&msg, "+draft/react");
+                                    if let (Some(r), Some(k)) = (reply_tag.clone(), react) {
+                                        if let Err(e) = bridge.send_reaction(target, &r, &k).await {
+                                            tracing::warn!(channel = %target, error = %e, "sending reaction failed");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Command::Raw(cmd, params) if cmd == "REDACT" => {
+                        // REDACT <channel> <msgid> [reason]
+                        if let [channel, msgid, rest @ ..] = params.as_slice() {
+                            if known_channel(channel) && is_joined(channel) {
+                                let reason = rest.first().map(String::as_str);
+                                if let Err(e) = bridge.redact(channel, msgid, reason).await {
+                                    tracing::warn!(channel = %channel, error = %e, "redact failed");
+                                }
+                            }
                         }
                     }
                     Command::BATCH(ref_name, sub, args) => {
@@ -692,7 +731,8 @@ async fn handle_batch(
         if let Some(ml) = multiline.remove(reference) {
             tracing::debug!(reference, target = %ml.target, lines = ml.lines.len(), "flushing multiline batch");
             let body = ml.lines.join("\n");
-            relay_from_irc(bridge, nick, prefix, &ml.target, body, ml.notice, true, true, caps, echo_tx).await?;
+            let reply = ml.reply.clone();
+            relay_from_irc(bridge, nick, prefix, &ml.target, body, ml.notice, true, true, caps, echo_tx, reply).await?;
         }
         return Ok(());
     }
@@ -703,7 +743,7 @@ async fn handle_batch(
     if is_multiline {
         let target = args.as_ref().and_then(|a| a.first().cloned()).unwrap_or_default();
         tracing::debug!(reference, %target, "opening multiline batch");
-        multiline.insert(reference.to_owned(), MultiLine { target, notice: false, lines: Vec::new() });
+        multiline.insert(reference.to_owned(), MultiLine { target, notice: false, lines: Vec::new(), reply: None });
     }
     Ok(())
 }
@@ -1031,6 +1071,7 @@ fn welcome_burst(server: &str, nick: &str) -> Vec<Message> {
             "CASEMAPPING=ascii".to_owned(),
             "NICKLEN=16".to_owned(),
             "NETWORK=matrix2078".to_owned(),
+            "CLIENTTAGDENY=*,-draft/react,-draft/reply".to_owned(),
             "are supported by this server".to_owned(),
         ]),
     ]
@@ -1197,6 +1238,7 @@ async fn control_command(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn relay_from_irc(
     bridge: &Arc<Bridge>,
     nick: &str,
@@ -1208,6 +1250,7 @@ async fn relay_from_irc(
     joined: bool,
     caps: &Caps,
     echo_tx: &mpsc::Sender<Message>,
+    reply_to: Option<String>,
 ) -> Result<()> {
     if !known {
         return Ok(());
@@ -1227,14 +1270,14 @@ async fn relay_from_irc(
     let nick = nick.to_owned();
     let echo_tx = echo_tx.clone();
     tokio::spawn(async move {
-        match bridge.send_from_irc(&target, body.clone(), notice).await {
+        match bridge.send_from_irc(&target, body.clone(), notice, reply_to.as_deref()).await {
             Ok(event_id) => {
                 if echo {
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    for m in crate::bridge::echo_messages(&caps, &prefix, &nick, &target, &body, &event_id, ts, notice) {
+                    for m in crate::bridge::echo_messages(&caps, &prefix, &nick, &target, &body, &event_id, ts, notice, reply_to.as_deref()) {
                         let _ = echo_tx.send(m).await;
                     }
                 }

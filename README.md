@@ -46,8 +46,18 @@ M3 adds end-to-end encryption: **Megolm rooms decrypt natively** (matrix-sdk /
 vodozemac) for both live relay and chathistory, **SAS device verification
 driven from IRC** via the `&matrix` pseudo-client (`/msg &matrix help`), and
 **encrypted media** (attachments in encrypted rooms are fetched with the
-token, AES-CTR-decrypted and served like any other file). See `AGENTS.md`
-for the milestone plan up to M6 (goguma/voidbar compat passes).
+token, AES-CTR-decrypted and served like any other file).
+
+M4 adds rich semantics on top: **formatting both ways** (ported from
+matrix2051: `org.matrix.custom.html` ⇄ mIRC codes incl. the 16–98 extended
+color palette and `\x04RRGGBB` hex colors, URL/mxid linkification), rich
+**replies** (`+draft/reply` tag both ways, reply-fallback stripping),
+**reactions** (`+draft/react` TAGMSG ⇄ `m.reaction`), **edits** (m.replace
+rendered as `* new body`) and **redactions** (`draft/message-redaction`
+`REDACT` command, downgraded to a NOTICE for legacy clients), and
+**mentions** (IRC nicks ⇄ `m.mentions`, `@user:server` mxids shortened to
+nicks). See `AGENTS.md` for the milestone plan up to M6 (goguma/voidbar
+compat passes).
 
 ## Usage
 

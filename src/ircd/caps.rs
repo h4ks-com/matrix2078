@@ -25,6 +25,7 @@ pub const SUPPORTED: &[(&str, Option<&str>)] = &[
     ("sasl", Some("PLAIN")),
     ("draft/chathistory", None),
     ("draft/multiline", None),
+    ("draft/message-redaction", None),
 ];
 
 /// Capabilities negotiated for a single connection.

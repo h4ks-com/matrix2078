@@ -158,6 +158,8 @@ impl Bridge {
         self.message_handler(tx.clone());
         self.topic_handler(tx.clone());
         self.encrypted_handler(tx.clone());
+        self.reaction_handler(tx.clone());
+        self.redaction_handler(tx.clone());
         self.presence_handler(tx);
     }
 
@@ -183,14 +185,21 @@ impl Bridge {
                     let matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(ev) = ev else {
                         return;
                     };
-                    // edits arrive as separate m.replace events; skip them for now
-                    if let Some(rel) = &ev.content.relates_to {
-                        if rel.rel_type()
-                            == Some(matrix_sdk::ruma::events::relation::RelationType::Replacement)
-                        {
-                            return;
-                        }
-                    }
+                    use matrix_sdk::ruma::events::room::message::Relation;
+                    // m.replace edits render the new content as "* new body",
+                    // replies carry +draft/reply and drop the "> " fallback
+                    let mut is_edit = false;
+                    let (reply_to, msgtype): (Option<String>, &MessageType) =
+                        match &ev.content.relates_to {
+                            Some(Relation::Replacement(rep)) => {
+                                is_edit = true;
+                                (Some(rep.event_id.to_string()), &rep.new_content.msgtype)
+                            }
+                            Some(Relation::Reply(r)) => {
+                                (Some(r.in_reply_to.event_id.to_string()), &ev.content.msgtype)
+                            }
+                            _ => (None, &ev.content.msgtype),
+                        };
                     if room.state() != RoomState::Joined {
                         return;
                     }
@@ -200,7 +209,7 @@ impl Bridge {
                     }
 
                     // in-room verification requests: route to the &matrix flow
-                    if let MessageType::VerificationRequest(c) = &ev.content.msgtype {
+                    if let MessageType::VerificationRequest(_) = &ev.content.msgtype {
                         hub.register_by_flow(&sender, ev.event_id.as_str()).await;
                         let _ = tx
                             .send(proto::user(
@@ -234,11 +243,31 @@ impl Bridge {
                     };
                     let channel = entry.channel.clone();
 
-                    let body = match render_body(&ev.content.msgtype, &client, &media, &cfg).await
-                    {
+                    let body = match render_body(msgtype, &client, &media, &cfg).await {
                         Some(b) => b,
                         None => return,
                     };
+                    // rich formatting: prefer the HTML form when present
+                    let body = if let Some(html) = formatted_of(msgtype) {
+                        let converted = crate::format::matrix_to_irc(&html);
+                        if converted.is_empty() { body } else { converted }
+                    } else {
+                        body
+                    };
+                    // strip the rich-reply fallback from plain bodies
+                    let body = if reply_to.is_some() && !is_edit {
+                        crate::format::strip_reply_fallback(&body)
+                    } else {
+                        body
+                    };
+                    // edits render as "* new body"
+                    let body = if is_edit {
+                        format!("* {body}")
+                    } else {
+                        body
+                    };
+                    // replace full mxids of room members with their IRC nicks
+                    let body = localize_mentions(&body, &room).await;
 
                     // JOIN must always be emitted before any PRIVMSG on a channel
                     let need_join = {
@@ -269,10 +298,13 @@ impl Bridge {
 
                     let ts = u64::from(ev.origin_server_ts.get());
                     let msgid = ev.event_id.to_string();
-                    let is_notice = matches!(&ev.content.msgtype, MessageType::Notice(_));
-                    let is_emote = matches!(&ev.content.msgtype, MessageType::Emote(_));
+                    let is_notice = matches!(msgtype, MessageType::Notice(_));
+                    let is_emote = matches!(msgtype, MessageType::Emote(_));
                     let sender_prefix = proto::user_prefix(&nick);
-                    let msgs = body_to_irc(&caps, &sender_prefix, &channel, &body, &msgid, ts, is_notice, is_emote);
+                    let msgs = body_to_irc(
+                        &caps, &sender_prefix, &channel, &body, &msgid, ts, is_notice, is_emote,
+                        reply_to.as_deref(),
+                    );
                     for m in msgs {
                         let _ = tx.send(m).await;
                     }
@@ -384,6 +416,154 @@ impl Bridge {
         );
     }
 
+    /// m.reaction → IRC TAGMSG carrying `+draft/reply` + `+draft/react`
+    /// (only meaningful for clients that negotiated message-tags).
+    fn reaction_handler(&self, tx: mpsc::Sender<Message>) {
+        let rooms = Arc::clone(&self.rooms);
+        let joined = Arc::clone(&self.joined);
+        let own = self.own_mxid.clone();
+        let caps = self.caps.clone();
+        self.client.add_event_handler(
+            move |ev: matrix_sdk::ruma::events::reaction::SyncReactionEvent, room: Room| {
+                let tx = tx.clone();
+                let rooms = Arc::clone(&rooms);
+                let joined = Arc::clone(&joined);
+                let own = own.clone();
+                let caps = caps.clone();
+                async move {
+                    if !caps.has("message-tags") {
+                        return;
+                    }
+                    let matrix_sdk::ruma::events::reaction::SyncReactionEvent::Original(ev) = ev else {
+                        return;
+                    };
+                    if room.state() != RoomState::Joined || ev.sender == own {
+                        return;
+                    }
+                    let ann = &ev.content.relates_to;
+                    let Some(entry) = ({
+                        let maps = rooms.lock().expect("rooms mutex");
+                        maps.get_by_room(room.room_id()).cloned()
+                    }) else {
+                        return;
+                    };
+                    // only relay reactions on channels the client occupies
+                    if !joined
+                        .lock()
+                        .expect("joined mutex")
+                        .contains(&entry.channel.to_ascii_lowercase())
+                    {
+                        return;
+                    }
+                    let nick = proto::mxid_to_nick(ev.sender.as_str());
+                    let ts = u64::from(ev.origin_server_ts.get());
+                    let mut m = proto::user(&nick, Command::Raw("TAGMSG".to_owned(), vec![entry.channel]));
+                    m.tags = Some(vec![
+                        proto::time_tag(ts),
+                        proto::msgid_tag(&ev.event_id.to_string()),
+                        irc::proto::message::Tag(
+                            "+draft/reply".to_owned(),
+                            Some(ann.event_id.to_string()),
+                        ),
+                        irc::proto::message::Tag(
+                            "+draft/react".to_owned(),
+                            Some(ann.key.clone()),
+                        ),
+                    ]);
+                    let _ = tx.send(m).await;
+                }
+            },
+        );
+    }
+
+    /// m.room.redaction → IRC `REDACT` (draft/message-redaction) or a
+    /// downgraded NOTICE for legacy clients.
+    fn redaction_handler(&self, tx: mpsc::Sender<Message>) {
+        let rooms = Arc::clone(&self.rooms);
+        let joined = Arc::clone(&self.joined);
+        let own = self.own_mxid.clone();
+        let caps = self.caps.clone();
+        let server = self.cfg.server_name.clone();
+        self.client.add_event_handler(
+            move |ev: matrix_sdk::ruma::events::room::redaction::SyncRoomRedactionEvent,
+                  room: Room| {
+                let tx = tx.clone();
+                let rooms = Arc::clone(&rooms);
+                let joined = Arc::clone(&joined);
+                let own = own.clone();
+                let caps = caps.clone();
+                let server = server.clone();
+                async move {
+                    let matrix_sdk::ruma::events::room::redaction::SyncRoomRedactionEvent::Original(ev) = ev else {
+                        return;
+                    };
+                    // room v11+ keeps `redacts` in the content
+                    let Some(redacted_id) = ev.content.redacts.clone() else {
+                        return;
+                    };
+                    if room.state() != RoomState::Joined || ev.sender == own {
+                        return;
+                    }
+                    let Some(entry) = ({
+                        let maps = rooms.lock().expect("rooms mutex");
+                        maps.get_by_room(room.room_id()).cloned()
+                    }) else {
+                        return;
+                    };
+                    if !joined
+                        .lock()
+                        .expect("joined mutex")
+                        .contains(&entry.channel.to_ascii_lowercase())
+                    {
+                        return;
+                    }
+                    let nick = proto::mxid_to_nick(ev.sender.as_str());
+                    let ts = u64::from(ev.origin_server_ts.get());
+                    let msgid = ev.event_id.to_string();
+                    let target = redacted_id.to_string();
+                    if caps.has("draft/message-redaction") && caps.has("message-tags") {
+                        let mut params = vec![entry.channel.clone(), target.clone()];
+                        if let Some(reason) = &ev.content.reason {
+                            params.push(reason.clone());
+                        }
+                        let mut m =
+                            proto::user(&nick, Command::Raw("REDACT".to_owned(), params));
+                        m.tags = Some(vec![
+                            proto::time_tag(ts),
+                            proto::msgid_tag(&msgid),
+                            irc::proto::message::Tag(
+                                "+draft/reply".to_owned(),
+                                Some(target),
+                            ),
+                        ]);
+                        let _ = tx.send(m).await;
+                    } else {
+                        let reason = ev
+                            .content
+                            .reason
+                            .as_deref()
+                            .map(|r| format!(": {r}"))
+                            .unwrap_or_default();
+                        let mut m = proto::user(
+                            &nick,
+                            Command::NOTICE(
+                                entry.channel.clone(),
+                                format!("deleted an event{reason}"),
+                            ),
+                        );
+                        m.tags = Some(vec![
+                            proto::time_tag(ts),
+                            proto::msgid_tag(&msgid),
+                        ]);
+                        let _ = m.tags; // NOTICE downgrade keeps tags minimal
+                        let _ = server;
+                        let _ = tx.send(m).await;
+                    }
+                }
+            },
+        );
+    }
+
     fn topic_handler(&self, tx: mpsc::Sender<Message>) {
         let tx_topic = tx.clone();
         let rooms_topic = Arc::clone(&self.rooms);
@@ -428,6 +608,7 @@ impl Bridge {
         channel: &str,
         body: String,
         notice: bool,
+        reply_to: Option<&str>,
     ) -> Result<String> {
         let room_id = {
             let maps = self.rooms.lock().expect("rooms mutex");
@@ -439,16 +620,96 @@ impl Bridge {
         let Some(room) = self.client.get_room(&room_id) else {
             anyhow::bail!("lost room {}", room_id.as_str());
         };
-        let content = if notice {
-            RoomMessageEventContent::notice_plain(body)
-        } else {
-            RoomMessageEventContent::text_plain(body)
+        // IRC → Matrix formatting (mIRC codes, links, mxid links)
+        let member_mxids: Vec<String> = room
+            .members(matrix_sdk::RoomMemberships::JOIN)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|m| m.user_id().to_string())
+            .collect();
+        let conv = crate::format::irc_to_matrix(&body, &member_mxids);
+        let mut content = match (&conv.html, notice) {
+            (Some(html), false) => RoomMessageEventContent::text_html(&conv.plain, html),
+            (Some(html), true) => RoomMessageEventContent::notice_html(&conv.plain, html),
+            (None, false) => RoomMessageEventContent::text_plain(&conv.plain),
+            (None, true) => RoomMessageEventContent::notice_plain(&conv.plain),
         };
+        if let Some(reply) = reply_to {
+            if let Ok(event_id) = matrix_sdk::ruma::EventId::parse(reply) {
+                use matrix_sdk::ruma::events::{
+                    relation::{InReplyTo, Reply},
+                    room::message::Relation,
+                };
+                content.relates_to = Some(Relation::Reply(Reply::new(InReplyTo::new(event_id))));
+            }
+        }
+        // mentions: IRC nicks present as words map back to Matrix user ids
+        let mentioned = mentioned_mxids(&body, &room, &member_mxids).await;
+        if !mentioned.is_empty() {
+            let mut m = matrix_sdk::ruma::events::Mentions::new();
+            m.user_ids = mentioned
+                .iter()
+                .filter_map(|s| matrix_sdk::ruma::UserId::parse(s.as_str()).ok())
+                .collect();
+            content.mentions = Some(m);
+        }
         let resp = room
             .send(content)
             .await
             .context("sending message to matrix room")?;
         Ok(resp.response.event_id.to_string())
+    }
+
+    /// Send a reaction (`+draft/react` TAGMSG) as an m.reaction annotation.
+    pub async fn send_reaction(&self, channel: &str, target: &str, key: &str) -> Result<()> {
+        let room_id = {
+            let maps = self.rooms.lock().expect("rooms mutex");
+            maps.get_by_channel(channel).map(|e| e.room_id.clone())
+        };
+        let Some(room_id) = room_id else {
+            anyhow::bail!("no room mapped for channel {channel}");
+        };
+        let Some(room) = self.client.get_room(&room_id) else {
+            anyhow::bail!("lost room {}", room_id.as_str());
+        };
+        let event_id =
+            matrix_sdk::ruma::EventId::parse(target).context("bad reply event id")?;
+        let ann = matrix_sdk::ruma::events::relation::Annotation::new(
+            event_id,
+            key.to_owned(),
+        );
+        if let Err(e) = room
+            .send(matrix_sdk::ruma::events::reaction::ReactionEventContent::new(ann))
+            .await
+        {
+            // re-reacting with the same key is a no-op on the Matrix side
+            if e.to_string().contains("M_DUPLICATE_ANNOTATION") {
+                return Ok(());
+            }
+            return Err(e).context("sending m.reaction");
+        }
+        Ok(())
+    }
+
+    /// Redact an event (IRC `REDACT` command).
+    pub async fn redact(&self, channel: &str, target: &str, reason: Option<&str>) -> Result<()> {
+        let room_id = {
+            let maps = self.rooms.lock().expect("rooms mutex");
+            maps.get_by_channel(channel).map(|e| e.room_id.clone())
+        };
+        let Some(room_id) = room_id else {
+            anyhow::bail!("no room mapped for channel {channel}");
+        };
+        let Some(room) = self.client.get_room(&room_id) else {
+            anyhow::bail!("lost room {}", room_id.as_str());
+        };
+        let event_id =
+            matrix_sdk::ruma::EventId::parse(target).context("bad redact target")?;
+        room.redact(&event_id, reason, None)
+            .await
+            .context("redacting event")?;
+        Ok(())
     }
 
     /// Snapshot of mapped rooms for the initial JOIN burst.
@@ -460,6 +721,7 @@ impl Bridge {
 /// Build outgoing IRC message(s) for a Matrix body:
 /// - multiline-capable clients get a `draft/multiline` batch;
 /// - everyone else gets one PRIVMSG per line, word-wrapped.
+#[allow(clippy::too_many_arguments)]
 fn body_to_irc(
     caps: &Caps,
     sender: &irc::proto::Prefix,
@@ -469,6 +731,7 @@ fn body_to_irc(
     ts: u64,
     notice: bool,
     emote: bool,
+    reply_to: Option<&str>,
 ) -> Vec<Message> {
     let lines = wrap_body(body);
     let mk_cmd = |line: String| -> Command {
@@ -486,6 +749,12 @@ fn body_to_irc(
             tags.push(irc::proto::message::Tag(
                 "draft/multiline".to_owned(),
                 Some(r.to_owned()),
+            ));
+        }
+        if let Some(reply) = reply_to {
+            tags.push(irc::proto::message::Tag(
+                "+draft/reply".to_owned(),
+                Some(reply.to_owned()),
             ));
         }
         tags
@@ -533,6 +802,7 @@ fn body_to_irc(
 }
 
 /// Build echo-message line(s) for the client's own Matrix delivery.
+#[allow(clippy::too_many_arguments)]
 pub fn echo_messages(
     caps: &Caps,
     prefix: &irc::proto::Prefix,
@@ -542,8 +812,9 @@ pub fn echo_messages(
     event_id: &str,
     ts: u64,
     notice: bool,
+    reply_to: Option<&str>,
 ) -> Vec<Message> {
-    body_to_irc(caps, prefix, target, body, event_id, ts, notice, false)
+    body_to_irc(caps, prefix, target, body, event_id, ts, notice, false, reply_to)
 }
 
 /// Split a body into IRC-safe lines: split on newlines, then word-wrap any
@@ -756,6 +1027,72 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// HTML `formatted_body` of a message msgtype, if the client sent
+/// `org.matrix.custom.html`.
+fn formatted_of(msgtype: &MessageType) -> Option<String> {
+    use matrix_sdk::ruma::events::room::message::MessageFormat;
+    let formatted = match msgtype {
+        MessageType::Text(c) => c.formatted.as_ref()?,
+        MessageType::Notice(c) => c.formatted.as_ref()?,
+        MessageType::Emote(c) => c.formatted.as_ref()?,
+        _ => return None,
+    };
+    if !matches!(formatted.format, MessageFormat::Html) {
+        return None;
+    }
+    Some(formatted.body.clone())
+}
+
+/// Replace full mxids (`@user:server`) of room members with IRC nicks.
+async fn localize_mentions(body: &str, room: &Room) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"@[\w./=#+-]+:[\w.\-]+(?::\d+)?").expect("mxid regex"));
+    if !re.is_match(body) {
+        return body.to_owned();
+    }
+    let members = room
+        .members(matrix_sdk::RoomMemberships::JOIN)
+        .await
+        .unwrap_or_default();
+    let mut out = String::with_capacity(body.len());
+    let mut last = 0;
+    for m in re.captures_iter(body) {
+        let whole = m.get(0).expect("group 0");
+        out.push_str(&body[last..whole.start()]);
+        let found = members
+            .iter()
+            .find(|mem| mem.user_id().as_str() == whole.as_str());
+        match found {
+            Some(mem) => out.push_str(&proto::mxid_to_nick(mem.user_id().as_str())),
+            None => out.push_str(whole.as_str()),
+        }
+        last = whole.end();
+    }
+    out.push_str(&body[last..]);
+    out
+}
+
+/// Matrix user ids mentioned by IRC nicks appearing as words in `body`.
+async fn mentioned_mxids(
+    body: &str,
+    _room: &Room,
+    member_mxids: &[String],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for word in body.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '[' && c != ']' && c != '^' && c != '{' && c != '}') {
+        for mxid in member_mxids {
+            let nick = proto::mxid_to_nick(mxid);
+            if nick.eq_ignore_ascii_case(word) && !out.iter().any(|m| m == mxid) {
+                out.push(mxid.clone());
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Replace `mxc://` URIs in a text body with local media-cache URLs.

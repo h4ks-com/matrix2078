@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 
 mod bridge;
 mod config;
+mod format;
 mod ircd;
 mod matrix;
 mod media;

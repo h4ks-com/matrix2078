@@ -21,14 +21,34 @@ use matrix_sdk::{
     Client,
     config::SyncSettings,
     encryption::verification::{SasVerification, Verification, VerificationRequest},
+    room::MessagesOptions,
     ruma::{
         events::{
             key::verification::request::ToDeviceKeyVerificationRequestEvent,
-            room::message::{ImageMessageEventContent, MessageType, RoomMessageEventContent},
+            room::message::{
+                ImageMessageEventContent, MessageType, RoomMessageEventContent,
+                ReplacementMetadata,
+            },
+            Mentions,
         },
-        OwnedUserId, RoomId, UserId,
+        EventId, OwnedUserId, RoomId, UserId,
     },
 };
+use matrix_sdk::ruma::events::room::message::Relation as MessageRelation;
+
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
 use tokio::sync::mpsc;
 
 fn out(line: &str) {
@@ -213,7 +233,7 @@ async fn run_verify(client: Client, start_to: Option<&str>) -> Result<()> {
     });
     let _ = server;
 
-    done_rx.recv().await.context("no verification completed");
+    let _ = done_rx.recv().await.context("no verification completed");
     // small settle delay for the DONE event exchange
     tokio::time::sleep(Duration::from_millis(1500)).await;
     Ok(())
@@ -245,6 +265,93 @@ async fn main() -> Result<()> {
             let room = client.get_room(&room_id).with_context(|| format!("not in room {room_id}"))?;
             let resp = room.send(RoomMessageEventContent::text_plain(text)).await?;
             out(&format!("SENT {}", resp.response.event_id));
+        }
+        "format" => {
+            // format <room> <html...>: plain body is derived by tag-stripping
+            let room_id = RoomId::parse(args.get(2).context("format <room> <html>")?)
+                .context("bad room id")?;
+            let html = args.get(3..).context("format <room> <html>")?.join(" ");
+            let plain = strip_tags(&html);
+            let room = client.get_room(&room_id).with_context(|| format!("not in room {room_id}"))?;
+            let resp = room.send(RoomMessageEventContent::text_html(plain, html)).await?;
+            out(&format!("SENT {}", resp.response.event_id));
+        }
+        "reply" => {
+            let room_id = RoomId::parse(args.get(2).context("reply <room> <event> <text>")?)
+                .context("bad room id")?;
+            let event = EventId::parse(args.get(3).context("reply <room> <event> <text>")?)
+                .context("bad event id")?;
+            let text = args.get(4..).context("reply <room> <event> <text>")?.join(" ");
+            let room = client.get_room(&room_id).with_context(|| format!("not in room {room_id}"))?;
+            let mut content = RoomMessageEventContent::text_plain(text);
+            content.relates_to = Some(MessageRelation::Reply(
+                matrix_sdk::ruma::events::relation::Reply::with_event_id(event),
+            ));
+            let resp = room.send(content).await?;
+            out(&format!("SENT {}", resp.response.event_id));
+        }
+        "react" => {
+            let room_id = RoomId::parse(args.get(2).context("react <room> <event> <key>")?)
+                .context("bad room id")?;
+            let event = EventId::parse(args.get(3).context("react <room> <event> <key>")?)
+                .context("bad event id")?;
+            let key = args.get(4).context("react <room> <event> <key>")?.clone();
+            let room = client.get_room(&room_id).with_context(|| format!("not in room {room_id}"))?;
+            let ann = matrix_sdk::ruma::events::relation::Annotation::new(event, key);
+            room.send(matrix_sdk::ruma::events::reaction::ReactionEventContent::new(ann))
+                .await
+                .context("sending m.reaction")?;
+            out("REACTED");
+        }
+        "edit" => {
+            let room_id = RoomId::parse(args.get(2).context("edit <room> <event> <text>")?)
+                .context("bad room id")?;
+            let event = EventId::parse(args.get(3).context("edit <room> <event> <text>")?)
+                .context("bad event id")?;
+            let text = args.get(4..).context("edit <room> <event> <text>")?.join(" ");
+            let room = client.get_room(&room_id).with_context(|| format!("not in room {room_id}"))?;
+            let content = RoomMessageEventContent::text_plain(text)
+                .make_replacement(ReplacementMetadata::new(event, None));
+            let resp = room.send(content).await?;
+            out(&format!("SENT {}", resp.response.event_id));
+        }
+        "redact" => {
+            let room_id = RoomId::parse(args.get(2).context("redact <room> <event> [reason]")?)
+                .context("bad room id")?;
+            let event = EventId::parse(args.get(3).context("redact <room> <event> [reason]")?)
+                .context("bad event id")?;
+            let reason = args.get(4..).map(|r| r.join(" "));
+            let room = client.get_room(&room_id).with_context(|| format!("not in room {room_id}"))?;
+            room.redact(&event, reason.as_deref(), None).await?;
+            out("REDACTED");
+        }
+        "mention" => {
+            let room_id = RoomId::parse(args.get(2).context("mention <room> <mxid> <text>")?)
+                .context("bad room id")?;
+            let mxid = args.get(3).context("mention <room> <mxid> <text>")?.clone();
+            let text = args.get(4..).context("mention <room> <mxid> <text>")?.join(" ");
+            let room = client.get_room(&room_id).with_context(|| format!("not in room {room_id}"))?;
+            let uid = UserId::parse(&mxid).context("bad mxid")?;
+            let mut mentions = Mentions::new();
+            mentions.user_ids.insert(uid);
+            let content = RoomMessageEventContent::text_plain(text).add_mentions(mentions);
+            let resp = room.send(content).await?;
+            out(&format!("SENT {}", resp.response.event_id));
+        }
+        "read" => {
+            // read <room> <n>: print the latest n message-like events (JSON)
+            let room_id = RoomId::parse(args.get(2).context("read <room> <n>")?)
+                .context("bad room id")?;
+            let n: u32 = args.get(3).context("read <room> <n>")?.parse().context("bad n")?;
+            let room = client.get_room(&room_id).with_context(|| format!("not in room {room_id}"))?;
+            let mut opts = MessagesOptions::backward();
+            opts.limit = matrix_sdk::ruma::UInt::from(n);
+            let msgs = room.messages(opts).await.context("fetching messages")?;
+            for item in msgs.chunk.iter().rev() {
+                let payload = serde_json::to_string(item.raw().json()).unwrap_or_default();
+                println!("EVT {payload}");
+            }
+            let _ = std::io::stdout().flush();
         }
         "send-image" => {
             let room_id = RoomId::parse(args.get(2).context("send-image <room> <file>")?)
