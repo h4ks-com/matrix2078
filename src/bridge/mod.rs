@@ -306,10 +306,6 @@ impl Bridge {
     pub fn entries(&self) -> Vec<RoomEntry> {
         self.rooms.lock().expect("rooms mutex").entries().to_vec()
     }
-
-    pub fn media_dir(&self) -> PathBuf {
-        crate::matrix::media::cache_dir(&self.cfg.state_dir)
-    }
 }
 
 async fn push_topic(
