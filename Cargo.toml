@@ -1,0 +1,33 @@
+[package]
+name = "matrix2078"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "IRC server (IRCd) backed by Matrix — chat on Matrix from your IRC client"
+repository = "https://github.com/h4ks-com/matrix2078"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+irc = { version = "1.1", default-features = false }
+matrix-sdk = "0.18"
+# force static/bundled sqlite on windows (no system sqlite3.lib here);
+# mirrors matrix-sdk-sqlite's own `bundled` feature
+libsqlite3-sys = { version = "0.35", features = ["bundled"] }
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+base64 = "0.22"
+regex = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

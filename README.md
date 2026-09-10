@@ -1,0 +1,70 @@
+# matrix2078
+
+An IRC server (IRCd) backed by [Matrix](https://matrix.org/): point a regular
+IRC client at it and chat on Matrix. The successor to
+[matrix2051](https://github.com/progval/matrix2051).
+
+> 2078: He announces that he's finally making the jump from screen+irssi to
+> tmux+weechat.
+
+*(xkcd 1782 alt text)*
+
+## Why
+
+matrix2051 had five fatal flaws, all fixed here by design:
+
+1. **No E2EE.** matrix2078 decrypts Megolm natively via matrix-sdk/vodozemac
+   and supports interactive SAS device verification driven through IRC prompts.
+2. **Images broken by authenticated media.** Media is fetched with the access
+   token, stored locally and served over a stable local HTTP URL — no raw
+   `mxc`/`/_matrix/media` URLs ever reach the IRC client.
+3. **Cannot join room version 12.** It works here (matrix-sdk 0.18).
+4. **"Fake renames" that break clients like goguma** (`not joined in channel`
+   and lost rooms). IRC channel names are stable per room — a Matrix room name
+   change surfaces as TOPIC, never as RENAME.
+5. **One session/device per IRC connection.** Matrix sessions are persistent
+   per user: reconnect and you're on the same device, with the same trust.
+
+## Status
+
+M0 (scaffold + minimal IRCd + one-room relay). See `AGENTS.md` for the
+milestone plan up to M6 (goguma/voidbar compat passes).
+
+## Usage
+
+```
+cargo run --release -- --allow-register
+```
+
+Then connect an IRC client to `127.0.0.1:2078`:
+
+- **server password**: your Matrix account password
+- **nick**: your Matrix localpart (e.g. `m2078` for `@m2078:example.org`)
+- for the very first login you can put the full `@user:domain` into the
+  IRC *username* field, or configure `homeserver` in `matrix2078.toml`
+
+The Matrix session (tokens + state) is stored encrypted under `state/`
+(keyed by argon2 + XChaCha20-Poly1305 under your IRC password) and reused on
+every reconnect — no device spam. After the first registration,
+`--allow-register` is no longer needed.
+
+Configuration: `matrix2078.toml` and `MATRIX2078_*` environment variables
+(`MATRIX2078_LISTEN`, `MATRIX2078_STATE_DIR`, `MATRIX2078_HOMESERVER`,
+`MATRIX2078_BRIDGE_ROOM`, `MATRIX2078_BRIDGE_CHANNEL`,
+`MATRIX2078_ALLOW_REGISTER`), plus `RUST_LOG` for log filtering.
+
+## License
+
+AGPL-3.0-only. matrix2078 ports substantial code and ideas from five
+Matrix↔IRC gateway ancestors:
+
+- [matrix2051](https://github.com/progval/matrix2051) (Elixir, AGPL) —
+  IRCv3 semantics and formatting
+- [matrirc](https://github.com/canatin/matrirc) (Rust, WTFPL) — session
+  crypto/restore, room mappings, SAS-over-IRC, media
+- [matrix-ircd](https://github.com/matrix-ircd/matrix-ircd) (Rust, Apache-2.0)
+  — module layout
+- [pto](https://github.com/1tldr/pto) (Rust, Apache-2.0) — SRV discovery,
+  TLS listeners
+- [AgentSmith](https://gitlab.com/robertfoss/agentsmith) (Crystal, MIT) —
+  command dispatch and pluggable formatters
