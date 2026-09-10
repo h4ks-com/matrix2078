@@ -490,14 +490,18 @@ async fn relay_loop(
                     }
                     Command::Raw(ref cmd, ref params) if cmd == "TAGMSG" => {
                         // +draft/reply + +draft/react => m.reaction
+                        // (spawned: a slow homeserver must not stall IRC reads)
                         if caps.has("message-tags") {
-                            if let Some(target) = params.first() {
-                                if known_channel(target) {
+                            if let Some(target) = params.first().cloned() {
+                                if known_channel(&target) {
                                     let react = tag_value(&msg, "+draft/react");
                                     if let (Some(r), Some(k)) = (reply_tag.clone(), react) {
-                                        if let Err(e) = bridge.send_reaction(target, &r, &k).await {
-                                            tracing::warn!(channel = %target, error = %e, "sending reaction failed");
-                                        }
+                                        let bridge = Arc::clone(bridge);
+                                        tokio::spawn(async move {
+                                            if let Err(e) = bridge.send_reaction(&target, &r, &k).await {
+                                                tracing::warn!(channel = %target, error = %e, "sending reaction failed");
+                                            }
+                                        });
                                     }
                                 }
                             }
@@ -505,12 +509,18 @@ async fn relay_loop(
                     }
                     Command::Raw(cmd, params) if cmd == "REDACT" => {
                         // REDACT <channel> <msgid> [reason]
+                        // (spawned: a slow homeserver must not stall IRC reads)
                         if let [channel, msgid, rest @ ..] = params.as_slice() {
                             if known_channel(channel) && is_joined(channel) {
-                                let reason = rest.first().map(String::as_str);
-                                if let Err(e) = bridge.redact(channel, msgid, reason).await {
-                                    tracing::warn!(channel = %channel, error = %e, "redact failed");
-                                }
+                                let reason = rest.first().cloned();
+                                let channel = channel.clone();
+                                let msgid = msgid.clone();
+                                let bridge = Arc::clone(bridge);
+                                tokio::spawn(async move {
+                                    if let Err(e) = bridge.redact(&channel, &msgid, reason.as_deref()).await {
+                                        tracing::warn!(channel = %channel, error = %e, "redact failed");
+                                    }
+                                });
                             }
                         }
                     }
