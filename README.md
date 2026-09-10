@@ -27,7 +27,7 @@ matrix2051 had five fatal flaws, all fixed here by design:
 
 ## Status
 
-M0–M2 done: minimal IRCd, persistent Matrix sessions, **all joined rooms
+M0–M3 done: minimal IRCd, persistent Matrix sessions, **all joined rooms
 bridged automatically** (matrix2051-style), stable per-room channel names
 (room renames surface as TOPIC, never as channel renames), room version 12
 works, authenticated media pipeline (images/files are downloaded with the
@@ -40,7 +40,13 @@ M2 adds IRCv3: capability negotiation, **SASL PLAIN** (user = full
 (event ids, used as chathistory anchors), **echo-message**, **draft/multiline**
 batches both ways (with word-wrap downgrade for legacy clients),
 **draft/chathistory** (LATEST/BEFORE/AFTER/BETWEEN/TARGETS via Matrix
-`/messages` + `/context`), away-notify via Matrix presence. See `AGENTS.md`
+`/messages` + `/context`), away-notify via Matrix presence.
+
+M3 adds end-to-end encryption: **Megolm rooms decrypt natively** (matrix-sdk /
+vodozemac) for both live relay and chathistory, **SAS device verification
+driven from IRC** via the `&matrix` pseudo-client (`/msg &matrix help`), and
+**encrypted media** (attachments in encrypted rooms are fetched with the
+token, AES-CTR-decrypted and served like any other file). See `AGENTS.md`
 for the milestone plan up to M6 (goguma/voidbar compat passes).
 
 ## Usage
@@ -64,6 +70,19 @@ session (tokens + state) is stored encrypted under `state/` (keyed by argon2
 + XChaCha20-Poly1305 under your IRC password) and reused on every reconnect
 — no device spam. After the first registration, `--allow-register` is no
 longer needed.
+
+### Verifying devices from IRC
+
+Interactive SAS verification is surfaced through the `&matrix` pseudo-client:
+
+```
+/msg &matrix help
+/msg &matrix devices                # list your (or someone's) devices
+/msg &matrix verify start @user:homeserver
+# when a verification request arrives you get a NOTICE, then:
+/msg &matrix verify accept          # shows the SAS emoji row
+/msg &matrix verify match           # or: verify mismatch
+```
 
 Configuration: `matrix2078.toml` and `MATRIX2078_*` environment variables
 (`MATRIX2078_LISTEN`, `MATRIX2078_MEDIA_LISTEN`, `MATRIX2078_STATE_DIR`,

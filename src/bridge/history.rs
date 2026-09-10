@@ -69,7 +69,21 @@ pub fn parse_iso_time(s: &str) -> Option<u64> {
 /// Extract a relayable message from a raw timeline event, if it is one.
 fn item_from_event(ev: &TimelineEvent) -> Option<HistoryItem> {
     let raw = ev.raw().deserialize().ok()?;
-    let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(msg)) = raw else {
+    let AnySyncTimelineEvent::MessageLike(msg) = raw else {
+        return None;
+    };
+    // events we could not decrypt stay m.room.encrypted — show a placeholder
+    if let AnySyncMessageLikeEvent::RoomEncrypted(matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(enc)) = &msg
+    {
+        return Some(HistoryItem {
+            ts_ms: u64::from(enc.origin_server_ts.get()),
+            event_id: enc.event_id.to_string(),
+            sender: enc.sender.to_string(),
+            notice: true,
+            body: "\u{1f512} [unable to decrypt]".to_owned(),
+        });
+    }
+    let AnySyncMessageLikeEvent::RoomMessage(msg) = msg else {
         return None;
     };
     let matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(orig) = msg else {

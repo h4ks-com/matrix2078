@@ -462,10 +462,18 @@ async fn relay_loop(
                     }
                     Command::PONG(..) => {}
                     Command::PRIVMSG(target, body) => {
-                        relay_from_irc(bridge, nick, &prefix, &target, body, false, known_channel(&target), is_joined(&target), caps, &echo_tx).await?;
+                        if target.eq_ignore_ascii_case(crate::matrix::verification::CONTROL_NICK) {
+                            control_command(framed, caps, server, nick, bridge, &body).await?;
+                        } else {
+                            relay_from_irc(bridge, nick, &prefix, &target, body, false, known_channel(&target), is_joined(&target), caps, &echo_tx).await?;
+                        }
                     }
                     Command::NOTICE(target, body) => {
-                        relay_from_irc(bridge, nick, &prefix, &target, body, true, known_channel(&target), is_joined(&target), caps, &echo_tx).await?;
+                        if target.eq_ignore_ascii_case(crate::matrix::verification::CONTROL_NICK) {
+                            control_command(framed, caps, server, nick, bridge, &body).await?;
+                        } else {
+                            relay_from_irc(bridge, nick, &prefix, &target, body, true, known_channel(&target), is_joined(&target), caps, &echo_tx).await?;
+                        }
                     }
                     Command::BATCH(ref_name, sub, args) => {
                         handle_batch(framed, server, nick, &prefix, &mut multiline, bridge, caps, &echo_tx, &ref_name, sub, args).await?;
@@ -1163,6 +1171,28 @@ async fn send_who(
         channel.to_owned(),
         "End of WHO list".to_owned(),
     ])).await?;
+    Ok(())
+}
+
+/// Dispatch a control command sent to the `&matrix` pseudo-client and reply
+/// with NOTICEs.
+async fn control_command(
+    framed: &mut Framed<TcpStream, IrcCodec>,
+    caps: &Caps,
+    server: &str,
+    nick: &str,
+    bridge: &Arc<Bridge>,
+    body: &str,
+) -> Result<()> {
+    tracing::debug!(nick, command = %body, "control command");
+    for reply in bridge.hub.command(body).await {
+        let m = proto::user(
+            crate::matrix::verification::CONTROL_NICK,
+            Command::NOTICE(nick.to_owned(), reply),
+        );
+        send_out(framed, caps, m).await?;
+    }
+    let _ = server;
     Ok(())
 }
 

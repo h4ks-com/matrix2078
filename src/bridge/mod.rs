@@ -31,6 +31,7 @@ use crate::{
     config::Config,
     ircd::{caps::Caps, proto},
     matrix::client::login_or_restore,
+    matrix::verification::VerificationHub,
     media::MediaServer,
 };
 
@@ -48,6 +49,8 @@ pub struct Bridge {
     pub media: Arc<MediaServer>,
     /// Capabilities negotiated by the owning IRC connection.
     pub caps: Caps,
+    /// SAS verification flows driven through the `&matrix` pseudo-client.
+    pub hub: Arc<VerificationHub>,
 }
 
 impl Bridge {
@@ -72,6 +75,7 @@ impl Bridge {
             .user_id()
             .map(|u| u.to_owned())
             .ok_or_else(|| anyhow::anyhow!("client has no user id after sync"))?;
+        let hub = VerificationHub::new(client.clone(), own_mxid.clone(), nick);
 
         let maps_path = channels_path(&cfg.state_dir, &crate::matrix::client::state_key(nick, login_user));
         let mut maps = RoomMaps::load(maps_path);
@@ -94,6 +98,7 @@ impl Bridge {
             cfg: cfg.clone(),
             media,
             caps,
+            hub,
         }))
     }
 
@@ -149,8 +154,10 @@ impl Bridge {
 
     /// Register event handlers pushing relayed IRC lines into `tx`.
     pub fn relay_matrix_to_irc(&self, tx: mpsc::Sender<Message>) {
+        self.hub.attach(tx.clone());
         self.message_handler(tx.clone());
         self.topic_handler(tx.clone());
+        self.encrypted_handler(tx.clone());
         self.presence_handler(tx);
     }
 
@@ -161,6 +168,7 @@ impl Bridge {
         let cfg = Arc::clone(&self.cfg);
         let media = Arc::clone(&self.media);
         let caps = self.caps.clone();
+        let hub = Arc::clone(&self.hub);
         self.client.add_event_handler(
             move |ev: SyncRoomMessageEvent, room: Room, client: Client| {
                 let tx = tx.clone();
@@ -170,6 +178,7 @@ impl Bridge {
                 let cfg = Arc::clone(&cfg);
                 let media = Arc::clone(&media);
                 let caps = caps.clone();
+                let hub = Arc::clone(&hub);
                 async move {
                     let matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(ev) = ev else {
                         return;
@@ -187,6 +196,26 @@ impl Bridge {
                     }
                     let sender = ev.sender.clone();
                     if sender == own {
+                        return;
+                    }
+
+                    // in-room verification requests: route to the &matrix flow
+                    if let MessageType::VerificationRequest(c) = &ev.content.msgtype {
+                        hub.register_by_flow(&sender, ev.event_id.as_str()).await;
+                        let _ = tx
+                            .send(proto::user(
+                                crate::matrix::verification::CONTROL_NICK,
+                                Command::NOTICE(
+                                    "*".to_owned(),
+                                    format!(
+                                        "verification request from {} in this room — \
+                                         /msg {} verify accept",
+                                        sender,
+                                        crate::matrix::verification::CONTROL_NICK
+                                    ),
+                                ),
+                            ))
+                            .await;
                         return;
                     }
 
@@ -289,6 +318,67 @@ impl Bridge {
                         };
                         let _ = tx.send(proto::user(&nick, cmd)).await;
                     }
+                }
+            },
+        );
+    }
+
+    /// Messages we could not decrypt (room keys missing): surface them as
+    /// placeholder lines instead of silently dropping.
+    fn encrypted_handler(&self, tx: mpsc::Sender<Message>) {
+        let rooms = Arc::clone(&self.rooms);
+        let joined = Arc::clone(&self.joined);
+        let own = self.own_mxid.clone();
+        self.client.add_event_handler(
+            move |ev: matrix_sdk::ruma::events::room::encrypted::SyncRoomEncryptedEvent,
+                  room: Room| {
+                let tx = tx.clone();
+                let rooms = Arc::clone(&rooms);
+                let joined = Arc::clone(&joined);
+                let own = own.clone();
+                async move {
+                    let matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(ev) = ev else {
+                        return;
+                    };
+                    if room.state() != RoomState::Joined || ev.sender == own {
+                        return;
+                    }
+                    let Some(entry) = ({
+                        let maps = rooms.lock().expect("rooms mutex");
+                        maps.get_by_room(room.room_id()).cloned()
+                    }) else {
+                        return;
+                    };
+                    let channel = entry.channel.clone();
+                    let need_join = {
+                        let mut j = joined.lock().expect("joined mutex");
+                        let lower = channel.to_ascii_lowercase();
+                        if j.contains(&lower) {
+                            false
+                        } else {
+                            j.insert(lower);
+                            true
+                        }
+                    };
+                    if need_join {
+                        let _ = tx
+                            .send(proto::user(
+                                &proto::mxid_to_nick(ev.sender.as_str()),
+                                Command::JOIN(channel.clone(), None, None),
+                            ))
+                            .await;
+                    }
+                    let nick = proto::mxid_to_nick(ev.sender.as_str());
+                    let ts = u64::from(ev.origin_server_ts.get());
+                    let mut m = proto::user(
+                        &nick,
+                        Command::NOTICE(
+                            channel.clone(),
+                            "\u{1f512} [unable to decrypt — keys not available yet]".to_owned(),
+                        ),
+                    );
+                    m.tags = Some(vec![proto::time_tag(ts), proto::msgid_tag(&ev.event_id.to_string())]);
+                    let _ = tx.send(m).await;
                 }
             },
         );
@@ -646,9 +736,11 @@ async fn attachment_line(
     let name = filename.filter(|n| !n.is_empty()).unwrap_or(body);
     let size_str = size.map(|s| format!(" ({})", human_size(s))).unwrap_or_default();
     let dir = crate::matrix::media::cache_dir(&cfg.state_dir);
+    tracing::debug!(kind, %name, "rendering attachment");
     let url = match crate::matrix::media::fetch_to_cache(client, &dir, source, mime).await {
         Ok(path) => {
             let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+            tracing::debug!(kind, file, "attachment cached");
             media.url_for(file)
         }
         Err(e) => format!("<media unavailable: {e:#}>"),
