@@ -9,7 +9,6 @@ use matrix_sdk::{
     ruma::{
         events::{
             AnySyncMessageLikeEvent, AnySyncTimelineEvent,
-            relation::RelationType,
             room::message::MessageType,
         },
         EventId, UInt, uint,
@@ -29,6 +28,7 @@ pub struct HistoryItem {
     pub sender: String,
     pub notice: bool,
     pub body: String,
+    pub reply_to: Option<String>,
 }
 
 /// Parse the `time=` tag format (`ISO 8601`) back into unix milliseconds.
@@ -81,6 +81,7 @@ fn item_from_event(ev: &TimelineEvent) -> Option<HistoryItem> {
             sender: enc.sender.to_string(),
             notice: true,
             body: "\u{1f512} [unable to decrypt]".to_owned(),
+            reply_to: None,
         });
     }
     let AnySyncMessageLikeEvent::RoomMessage(msg) = msg else {
@@ -89,19 +90,29 @@ fn item_from_event(ev: &TimelineEvent) -> Option<HistoryItem> {
     let matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(orig) = msg else {
         return None;
     };
+    use matrix_sdk::ruma::events::room::message::Relation;
+    let mut reply_to = None;
     if let Some(rel) = &orig.content.relates_to {
-        if rel.rel_type() == Some(RelationType::Replacement) {
-            return None; // edits are folded into the original in M4
+        match rel {
+            Relation::Replacement(_) => return None, // edits are folded into the original in M4
+            Relation::Reply(r) => {
+                reply_to = Some(r.in_reply_to.event_id.to_string());
+            }
+            _ => {}
         }
     }
     let ts = u64::from(orig.origin_server_ts.get());
-    let body = history_body(&orig.content.msgtype);
+    let mut body = history_body(&orig.content.msgtype);
+    if reply_to.is_some() {
+        body = crate::format::strip_reply_fallback(&body);
+    }
     Some(HistoryItem {
         ts_ms: ts,
         event_id: orig.event_id.to_string(),
         sender: orig.sender.to_string(),
         notice: matches!(orig.content.msgtype, MessageType::Notice(_)),
         body,
+        reply_to,
     })
 }
 
@@ -243,7 +254,8 @@ pub async fn before_timestamp(room: &Room, ts_ms: u64, limit: usize) -> Result<V
     Ok(items)
 }
 
-/// Map history items to IRC PRIVMSG/NOTICE lines with `time` and `msgid` tags.
+/// Map history items to IRC PRIVMSG/NOTICE lines with `time`/`msgid` (and
+/// `+draft/reply` for replies) tags.
 pub fn to_irc(target: &str, items: &[HistoryItem]) -> Vec<irc::proto::Message> {
     items
         .iter()
@@ -256,7 +268,14 @@ pub fn to_irc(target: &str, items: &[HistoryItem]) -> Vec<irc::proto::Message> {
                 irc::proto::Command::PRIVMSG(target.to_owned(), i.body.clone())
             };
             let mut m = proto::user(&nick, cmd);
-            m.tags = Some(vec![proto::time_tag(i.ts_ms), proto::msgid_tag(&i.event_id)]);
+            let mut tags = vec![proto::time_tag(i.ts_ms), proto::msgid_tag(&i.event_id)];
+            if let Some(r) = &i.reply_to {
+                tags.push(irc::proto::message::Tag(
+                    "+draft/reply".to_owned(),
+                    Some(r.clone()),
+                ));
+            }
+            m.tags = Some(tags);
             m
         })
         .collect()

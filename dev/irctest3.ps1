@@ -92,7 +92,7 @@ Check 'chathistory contains our echo' (Wait-For '@time=[^;]+;msgid=[^ ]+ :m2078-
 
 # --- 8. CHATHISTORY BEFORE with a msgid anchor
 $msgid = $null
-if ($out.ToString() -match 'msgid=([A-Za-z0-9_\-]+) :m2078-peer') { $msgid = $matches[1] }
+if ($out.ToString() -match 'msgid=(\$[A-Za-z0-9_\-]+) :m2078-peer') { $msgid = $matches[1] }
 if ($msgid) {
     $w.WriteLine("CHATHISTORY BEFORE #m2078-plain msgid=$msgid 5")
     Check 'chathistory BEFORE batch' (Wait-For 'BATCH \+\S+ chathistory #m2078-plain' 20)
