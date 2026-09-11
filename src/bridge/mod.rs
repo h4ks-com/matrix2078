@@ -67,6 +67,10 @@ pub struct Bridge {
     /// Pending invitations awaiting `/msg &matrix accept|decline`.
     pub invites: Arc<Mutex<Vec<PendingInvite>>>,
     next_invite_idx: Arc<std::sync::atomic::AtomicU64>,
+    /// Event ids we sent from *this* connection: their sync echo must not be
+    /// relayed back (messages from the same account via other clients still
+    /// must be, like matrix2051 did).
+    sent: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Bridge {
@@ -105,7 +109,18 @@ impl Bridge {
             irc_nick: nick.to_owned(),
             invites: Arc::new(Mutex::new(Vec::new())),
             next_invite_idx: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            sent: Arc::new(Mutex::new(HashSet::new())),
         }))
+    }
+
+    /// Remember an event we sent from this connection, so its sync echo is
+    /// not relayed back to the client.
+    fn note_sent(&self, event_id: &str) {
+        let mut s = self.sent.lock().expect("sent mutex");
+        if s.len() > 4096 {
+            s.clear();
+        }
+        s.insert(event_id.to_owned());
     }
 
     /// Compute (or refresh) the mapping for a joined room: 2-party DMs map
@@ -210,6 +225,7 @@ impl Bridge {
         let caps = self.caps.clone();
         let hub = Arc::clone(&self.hub);
         let irc_nick = self.irc_nick.clone();
+        let sent = Arc::clone(&self.sent);
         self.client.add_event_handler(
             move |ev: SyncRoomMessageEvent, room: Room, client: Client| {
                 let tx = tx.clone();
@@ -221,6 +237,7 @@ impl Bridge {
                 let caps = caps.clone();
                 let hub = Arc::clone(&hub);
                 let irc_nick = irc_nick.clone();
+                let sent = Arc::clone(&sent);
                 async move {
                     let matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(ev) = ev else {
                         return;
@@ -244,7 +261,12 @@ impl Bridge {
                         return;
                     }
                     let sender = ev.sender.clone();
-                    if sender == own {
+                    // our own echo from this connection was already delivered
+                    // via echo-message; the same account on another client
+                    // must still come through
+                    if sender == own
+                        && sent.lock().expect("sent mutex").contains(&ev.event_id.to_string())
+                    {
                         return;
                     }
 
@@ -406,6 +428,7 @@ impl Bridge {
         let joined = Arc::clone(&self.joined);
         let own = self.own_mxid.clone();
         let irc_nick = self.irc_nick.clone();
+        let sent = Arc::clone(&self.sent);
         self.client.add_event_handler(
             move |ev: matrix_sdk::ruma::events::room::encrypted::SyncRoomEncryptedEvent,
                   room: Room| {
@@ -414,11 +437,15 @@ impl Bridge {
                 let joined = Arc::clone(&joined);
                 let own = own.clone();
                 let irc_nick = irc_nick.clone();
+                let sent = Arc::clone(&sent);
                 async move {
                     let matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(ev) = ev else {
                         return;
                     };
-                    if room.state() != RoomState::Joined || ev.sender == own {
+                    if room.state() != RoomState::Joined
+                        || (ev.sender == own
+                            && sent.lock().expect("sent mutex").contains(&ev.event_id.to_string()))
+                    {
                         return;
                     }
                     let Some(entry) = ({
@@ -474,6 +501,7 @@ impl Bridge {
         let joined = Arc::clone(&self.joined);
         let own = self.own_mxid.clone();
         let caps = self.caps.clone();
+        let sent = Arc::clone(&self.sent);
         self.client.add_event_handler(
             move |ev: matrix_sdk::ruma::events::reaction::SyncReactionEvent, room: Room| {
                 let tx = tx.clone();
@@ -481,6 +509,7 @@ impl Bridge {
                 let joined = Arc::clone(&joined);
                 let own = own.clone();
                 let caps = caps.clone();
+                let sent = Arc::clone(&sent);
                 async move {
                     if !caps.has("message-tags") {
                         return;
@@ -488,7 +517,10 @@ impl Bridge {
                     let matrix_sdk::ruma::events::reaction::SyncReactionEvent::Original(ev) = ev else {
                         return;
                     };
-                    if room.state() != RoomState::Joined || ev.sender == own {
+                    if room.state() != RoomState::Joined
+                        || (ev.sender == own
+                            && sent.lock().expect("sent mutex").contains(&ev.event_id.to_string()))
+                    {
                         return;
                     }
                     let ann = &ev.content.relates_to;
@@ -535,6 +567,7 @@ impl Bridge {
         let own = self.own_mxid.clone();
         let caps = self.caps.clone();
         let server = self.cfg.server_name.clone();
+        let sent = Arc::clone(&self.sent);
         self.client.add_event_handler(
             move |ev: matrix_sdk::ruma::events::room::redaction::SyncRoomRedactionEvent,
                   room: Room| {
@@ -544,6 +577,7 @@ impl Bridge {
                 let own = own.clone();
                 let caps = caps.clone();
                 let server = server.clone();
+                let sent = Arc::clone(&sent);
                 async move {
                     let matrix_sdk::ruma::events::room::redaction::SyncRoomRedactionEvent::Original(ev) = ev else {
                         return;
@@ -552,7 +586,10 @@ impl Bridge {
                     let Some(redacted_id) = ev.content.redacts.clone() else {
                         return;
                     };
-                    if room.state() != RoomState::Joined || ev.sender == own {
+                    if room.state() != RoomState::Joined
+                        || (ev.sender == own
+                            && sent.lock().expect("sent mutex").contains(&ev.event_id.to_string()))
+                    {
                         return;
                     }
                     let Some(entry) = ({
@@ -699,13 +736,6 @@ impl Bridge {
         invites.iter().map(|inv| invite_prompt(&self.irc_nick, inv)).collect()
     }
 
-    /// Keep the sync loop running in the background. The returned handle
-    /// must be aborted when the owning IRC connection goes away.
-    pub fn spawn_sync(&self) -> tokio::task::JoinHandle<()> {
-        let client = self.client.clone();
-        tokio::spawn(sync_forever(client))
-    }
-
     /// Deliver an IRC line to the mapped Matrix room. Returns the new event id.
     pub async fn send_from_irc(
         &self,
@@ -724,7 +754,9 @@ impl Bridge {
         let Some(room) = self.client.get_room(&room_id) else {
             anyhow::bail!("lost room {}", room_id.as_str());
         };
-        Self::send_room_message(&room, body, notice, reply_to).await
+        let event_id = Self::send_room_message(&room, body, notice, reply_to).await?;
+        self.note_sent(&event_id);
+        Ok(event_id)
     }
 
     /// Deliver an IRC query PRIVMSG/NOTICE to the DM room with `nick`,
@@ -756,7 +788,9 @@ impl Bridge {
         };
         // keep the mapping fresh (covers newly created DMs)
         Self::ensure_room_mapping(&self.rooms, &room).await;
-        Self::send_room_message(&room, body, notice, reply_to).await
+        let event_id = Self::send_room_message(&room, body, notice, reply_to).await?;
+        self.note_sent(&event_id);
+        Ok(event_id)
     }
 
     /// Resolve an IRC nick to a Matrix user id by scanning the members of
@@ -783,6 +817,13 @@ impl Bridge {
         notice: bool,
         reply_to: Option<&str>,
     ) -> Result<String> {
+        // a bare http(s) link becomes a native m.image/m.file/… upload so
+        // Matrix clients render it as media instead of a bare URL
+        if reply_to.is_none() && !notice {
+            if let Some(res) = try_url_attachment(room, body.trim()).await {
+                return res;
+            }
+        }
         // IRC → Matrix formatting (mIRC codes, links, mxid links)
         let member_mxids: Vec<String> = room
             .members(matrix_sdk::RoomMemberships::JOIN)
@@ -975,17 +1016,18 @@ impl Bridge {
             event_id,
             key.to_owned(),
         );
-        if let Err(e) = room
+        match room
             .send(matrix_sdk::ruma::events::reaction::ReactionEventContent::new(ann))
             .await
         {
-            // re-reacting with the same key is a no-op on the Matrix side
-            if e.to_string().contains("M_DUPLICATE_ANNOTATION") {
-                return Ok(());
+            Ok(resp) => {
+                self.note_sent(resp.response.event_id.as_str());
+                Ok(())
             }
-            return Err(e).context("sending m.reaction");
+            // re-reacting with the same key is a no-op on the Matrix side
+            Err(e) if e.to_string().contains("M_DUPLICATE_ANNOTATION") => Ok(()),
+            Err(e) => Err(e).context("sending m.reaction"),
         }
-        Ok(())
     }
 
     /// Redact an event (IRC `REDACT` command).
@@ -1002,10 +1044,13 @@ impl Bridge {
         };
         let event_id =
             matrix_sdk::ruma::EventId::parse(target).context("bad redact target")?;
-        room.redact(&event_id, reason, None)
-            .await
-            .context("redacting event")?;
-        Ok(())
+        match room.redact(&event_id, reason, None).await {
+            Ok(resp) => {
+                self.note_sent(resp.event_id.as_str());
+                Ok(())
+            }
+            Err(e) => Err(e).context("redacting event"),
+        }
     }
 
     /// Snapshot of mapped rooms for the initial JOIN burst.
@@ -1263,6 +1308,169 @@ pub(crate) async fn sync_forever(client: Client) {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     }
+}
+
+/// Max bytes fetched for a bare-URL upload.
+const URL_ATTACHMENT_LIMIT: usize = 25 * 1024 * 1024;
+
+/// Extension → MIME for bare-URL uploads. `None` means "not recognizable,
+/// keep the message a plain text link".
+fn ext_mime(url: &str) -> Option<&'static str> {
+    let path = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url);
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let name = path.rsplit('/').next().unwrap_or("");
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "m4a" => "audio/mp4",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "7z" => "application/x-7z-compressed",
+        "txt" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "doc" | "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" | "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" | "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "apk" => "application/vnd.android.package-archive",
+        "iso" => "application/x-iso9660-image",
+        "deb" => "application/vnd.debian.binary-package",
+        "rpm" => "application/x-rpm",
+        _ => return None,
+    })
+}
+
+/// Filename of a URL path ("download" when the path has none).
+fn url_filename(url: &str) -> String {
+    let path = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let name = path.rsplit('/').next().unwrap_or("");
+    let name = percent_decode(name);
+    if name.is_empty() {
+        "download".to_owned()
+    } else {
+        name
+    }
+}
+
+/// Minimal percent-decoding for filename display.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() + 1 && i + 2 < bytes.len() {
+            let hex = &s[i + 1..i + 3];
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// If `body` is a bare http(s) URL pointing at recognizable media, download
+/// it (size-capped) and send it as a native Matrix attachment. Returns
+/// `None` when the body should stay a plain text message; `Some(result)` is
+/// the final send outcome.
+async fn try_url_attachment(room: &Room, body: &str) -> Option<Result<String>> {
+    if !(body.starts_with("http://") || body.starts_with("https://")) || body.contains(char::is_whitespace) {
+        return None;
+    }
+    // decide the MIME: Content-Type wins, the extension is the fallback
+    let http = match reqwest::Client::builder()
+        .user_agent(concat!(
+            "matrix2078/",
+            env!("CARGO_PKG_VERSION"),
+            " (+https://github.com/h4ks-com/matrix2078)"
+        ))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let resp = match http.get(body).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            tracing::debug!(url = body, status = %r.status(), "url attachment: fetch failed");
+            return None;
+        }
+        Err(e) => {
+            tracing::debug!(url = body, error = %e, "url attachment: network error");
+            return None;
+        }
+    };
+    let header_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or("").trim().to_owned());
+    let mime_str = match header_type {
+        Some(t) if !t.is_empty() && t != "application/octet-stream" => t,
+        _ => ext_mime(body)?.to_owned(),
+    };
+    // only media/document types become uploads; web pages stay links
+    let is_media = mime_str.starts_with("image/")
+        || mime_str.starts_with("video/")
+        || mime_str.starts_with("audio/")
+        || mime_str.starts_with("application/")
+        || mime_str.starts_with("text/plain");
+    if !is_media || mime_str == "text/html" {
+        tracing::debug!(url = body, mime = %mime_str, "url attachment: not a media type");
+        return None;
+    }
+    // size guard before pulling the body
+    if let Some(len) = resp.content_length() {
+        if len as usize > URL_ATTACHMENT_LIMIT {
+            return None;
+        }
+    }
+    let data = match resp.bytes().await {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+    if data.is_empty() || data.len() > URL_ATTACHMENT_LIMIT {
+        return None;
+    }
+    let mime: mime::Mime = match mime_str.parse() {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+    let filename = url_filename(body);
+    tracing::info!(%filename, %mime_str, bytes = data.len(), "uploading bare URL as attachment");
+    let send = room
+        .send_attachment(
+            filename,
+            &mime,
+            data.to_vec(),
+            matrix_sdk::attachment::AttachmentConfig::new(),
+        )
+        .await;
+    Some(send.map(|r| r.event_id.to_string()).map_err(|e| anyhow::anyhow!("uploading URL: {e:#}")))
 }
 
 fn channels_path(state_dir: &Path, nick: &str) -> PathBuf {

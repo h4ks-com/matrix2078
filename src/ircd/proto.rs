@@ -55,7 +55,9 @@ pub fn mxid_to_nick(mxid: &str) -> String {
 
 /// `msgid` (message id) tag: Matrix event id without the leading `$`.
 pub fn msgid_tag(event_id: &str) -> Tag {
-    Tag("msgid".to_owned(), Some(event_id.trim_start_matches('$').to_owned()))
+    // keep the full event id: `+draft/reply` / `+draft/react` values must
+    // match the `msgid` tag exactly, clients compare them as opaque strings
+    Tag("msgid".to_owned(), Some(event_id.to_owned()))
 }
 
 /// `time` (server-time) tag: ISO 8601 with millisecond precision, `Z` suffix.
@@ -124,10 +126,12 @@ mod tests {
     }
 
     #[test]
-    fn msgid_strips_dollar() {
+    fn msgid_keeps_full_event_id() {
+        // +draft/reply / +draft/react values carry the full id, so the
+        // msgid tag must not diverge from it
         let Tag(k, v) = msgid_tag("$abc123");
         assert_eq!(k, "msgid");
-        assert_eq!(v.as_deref(), Some("abc123"));
+        assert_eq!(v.as_deref(), Some("$abc123"));
     }
 
     #[test]
@@ -169,13 +173,13 @@ mod tests {
         // "hi" has no spaces, so the codec needs no trailing colon
         assert_eq!(
             m.to_string(),
-            "@time=2024-02-29T00:00:00.123Z;msgid=x :alice!matrix@matrix PRIVMSG #c hi\r\n"
+            "@time=2024-02-29T00:00:00.123Z;msgid=$x :alice!matrix@matrix PRIVMSG #c hi\r\n"
         );
         let mut m2 = user("alice", Command::PRIVMSG("#c".into(), "hi there".into()));
         m2.tags = Some(vec![time_tag(1709164800123), msgid_tag("$x")]);
         assert_eq!(
             m2.to_string(),
-            "@time=2024-02-29T00:00:00.123Z;msgid=x :alice!matrix@matrix PRIVMSG #c :hi there\r\n"
+            "@time=2024-02-29T00:00:00.123Z;msgid=$x :alice!matrix@matrix PRIVMSG #c :hi there\r\n"
         );
     }
 }

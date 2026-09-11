@@ -117,7 +117,7 @@ Check 'peer sees formatted_body' ($rd -match [regex]::Escape("$stamp2") -and $rd
 $peerOut = Invoke-Peer @('reply', $roomPlain, "`$$ev1", 'reply body here')
 Check 'peer sent reply' ($peerOut -match '(?m)^SENT \$')
 $ev2 = if ($peerOut -match '(?m)^SENT \$(\S+)') { $matches[1] } else { $null }
-Check 'reply relayed with draft/reply tag' ($ev2 -and (Wait-For ([regex]::Escape("msgid=$ev2") + '.*\+draft/reply=\$' + [regex]::Escape($ev1) + '.*reply body here') 30))
+Check 'reply relayed with draft/reply tag' ($ev2 -and (Wait-For ([regex]::Escape("msgid=`$$ev2") + '.*\+draft/reply=\$' + [regex]::Escape($ev1) + '.*reply body here') 30))
 Check 'reply fallback stripped' (-not ($out.ToString() -match [regex]::Escape('> <@')))
 # IRC -> Matrix: PRIVMSG with +draft/reply tag
 $stamp3 = "irc-reply $(Get-Random)"
@@ -143,7 +143,7 @@ Check 'matrix reaction annotation' ($rd -match ('(?s)m\.reaction.*' + [regex]::E
 $peerOut = Invoke-Peer @('edit', $roomPlain, "`$$ev1", 'edited body now')
 Check 'peer sent edit' ($peerOut -match '(?m)^SENT \$')
 $ev3 = if ($peerOut -match '(?m)^SENT \$(\S+)') { $matches[1] } else { $null }
-Check 'edit relayed as * line' ($ev3 -and (Wait-For ([regex]::Escape("msgid=$ev3") + '.*PRIVMSG [^ ]+ :\* edited body now') 30))
+Check 'edit relayed as * line' ($ev3 -and (Wait-For ([regex]::Escape("msgid=`$$ev3") + '.*PRIVMSG [^ ]+ :\* edited body now') 30))
 
 # --- 7. redactions both ways
 # Matrix -> IRC: REDACT line (cap negotiated)

@@ -15,6 +15,7 @@ pub const SUPPORTED: &[(&str, Option<&str>)] = &[
     ("server-time", None),
     ("echo-message", None),
     ("message-tags", None),
+    ("msgid", None),
     ("away-notify", None),
     ("account-notify", None),
     ("account-tag", None),
@@ -60,29 +61,31 @@ impl Caps {
 
     /// Apply a `CAP REQ` identifier list (`cap1 cap2 -cap3`).
     ///
-    /// Returns `Ok(ack_line)` with the names to ACK, or `Err(nak_line)` if an
-    /// unknown capability was requested (the whole REQ is NAKed and nothing
-    /// is applied).
-    pub fn apply_req(&mut self, identifier_params: &str) -> Result<String, String> {
-        let tokens: Vec<&str> = identifier_params.split_whitespace().collect();
-        for token in &tokens {
+    /// Returns `(ack_list, nak_list)`: supported tokens are applied and
+    /// ACKed, unknown ones are NAKed. Acking known caps while naking the
+    /// unknown rest (instead of rejecting the whole REQ) is what clients
+    /// like girc expect when they request several caps in one line.
+    pub fn apply_req(&mut self, identifier_params: &str) -> (String, String) {
+        let mut ack: Vec<&str> = Vec::new();
+        let mut nak: Vec<&str> = Vec::new();
+        for token in identifier_params.split_whitespace() {
             let name = token.strip_prefix('-').unwrap_or(token);
-            if !SUPPORTED.iter().any(|(supported, _)| supported.eq_ignore_ascii_case(name)) {
-                return Err(identifier_params.to_owned());
-            }
-        }
-        for token in &tokens {
-            let (disable, name) = match token.strip_prefix('-') {
-                Some(n) => (true, n),
-                None => (false, &token[..]),
-            };
-            if disable {
-                self.enabled.remove(name.to_owned().as_str());
+            if SUPPORTED.iter().any(|(supported, _)| supported.eq_ignore_ascii_case(name)) {
+                let (disable, bare) = match token.strip_prefix('-') {
+                    Some(n) => (true, n),
+                    None => (false, token),
+                };
+                if disable {
+                    self.enabled.remove(bare.to_ascii_lowercase().as_str());
+                } else {
+                    self.enabled.insert(bare.to_owned());
+                }
+                ack.push(token);
             } else {
-                self.enabled.insert(name.to_owned());
+                nak.push(token);
             }
         }
-        Ok(tokens.into_iter().map(str::to_owned).collect::<Vec<_>>().join(" "))
+        (ack.join(" "), nak.join(" "))
     }
 }
 
@@ -101,7 +104,7 @@ mod tests {
     #[test]
     fn req_ack_and_disable() {
         let mut caps = Caps::default();
-        let ack = caps.apply_req("server-time echo-message -batch").unwrap();
+        let (ack, _) = caps.apply_req("server-time echo-message -batch");
         assert_eq!(ack, "server-time echo-message -batch");
         assert!(caps.has("server-time"));
         assert!(!caps.has("batch"));
@@ -109,12 +112,13 @@ mod tests {
     }
 
     #[test]
-    fn req_unknown_naks_everything() {
+    fn req_unknown_is_naked_but_known_still_acks() {
         let mut caps = Caps::default();
-        caps.apply_req("server-time").unwrap();
-        let err = caps.apply_req("echo-message bogus-cap").unwrap_err();
-        assert_eq!(err, "echo-message bogus-cap");
-        assert!(!caps.has("echo-message"), "unknown cap must not partially apply");
-        assert!(caps.has("server-time"));
+        caps.apply_req("server-time");
+        let (ack, nak) = caps.apply_req("echo-message bogus-cap");
+        assert_eq!(ack, "echo-message");
+        assert_eq!(nak, "bogus-cap");
+        assert!(caps.has("echo-message"));
+        assert!(!caps.has("bogus-cap"));
     }
 }

@@ -19,6 +19,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 irc = { version = "1.1", default-features = false }
 matrix-sdk = "0.18"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+mime = "0.3"
 # force static/bundled sqlite on windows (no system sqlite3.lib here);
 # mirrors matrix-sdk-sqlite's own `bundled` feature
 libsqlite3-sys = { version = "0.35", features = ["bundled"] }

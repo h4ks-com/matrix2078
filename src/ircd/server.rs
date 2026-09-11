@@ -255,17 +255,16 @@ async fn handle_cap<S: ClientStream>(
         }
         REQ => {
             let req = caps_req.unwrap_or("");
-            match reg.caps.apply_req(req) {
-                Ok(_) => {
-                    framed
-                        .send(srv(server, Command::CAP(Some("*".into()), ACK, Some(req.to_owned()), None)))
-                        .await?;
-                }
-                Err(_) => {
-                    framed
-                        .send(srv(server, Command::CAP(Some("*".into()), NAK, Some(req.to_owned()), None)))
-                        .await?;
-                }
+            let (ack, nak) = reg.caps.apply_req(req);
+            if !ack.is_empty() {
+                framed
+                    .send(srv(server, Command::CAP(Some("*".into()), ACK, Some(ack), None)))
+                    .await?;
+            }
+            if !nak.is_empty() {
+                framed
+                    .send(srv(server, Command::CAP(Some("*".into()), NAK, Some(nak), None)))
+                    .await?;
             }
             reg.cap_started = true;
         }
@@ -379,7 +378,7 @@ mod tests {
     #[test]
     fn outgoing_tag_filtering() {
         let mut caps = Caps::default();
-        caps.apply_req("server-time message-tags batch draft/multiline").unwrap();
+        caps.apply_req("server-time message-tags batch draft/multiline");
         let mut m = proto::user("alice", Command::PRIVMSG("#c".into(), "hi".into()));
         m.tags = Some(vec![
             proto::time_tag(1709164800123),
@@ -567,14 +566,16 @@ async fn send_out<S: ClientStream>(
     Ok(())
 }
 
-/// Keep only tags the client negotiated for (server-time, message-tags).
+/// Keep only tags the client negotiated for (server-time, msgid,
+/// message-tags).
 fn tags_for_client(caps: &Caps, m: Message) -> Message {
     let Some(tags) = m.tags else { return m };
     let filtered: Vec<Tag> = tags
         .into_iter()
         .filter(|t| match t.0.as_str() {
             "time" => caps.has("server-time"),
-            "msgid" | "account" => caps.has("message-tags"),
+            "msgid" => caps.has("msgid") || caps.has("message-tags"),
+            "account" => caps.has("account-tag"),
             other => caps.has("message-tags") && (other.starts_with("draft/") || other.starts_with('+')),
         })
         .collect();
@@ -615,8 +616,28 @@ async fn relay_loop<S: ClientStream>(
     let names_limit = bridge.cfg.bridge.names_limit;
     let mut multiline: HashMap<String, MultiLine> = HashMap::new();
     let batch_counter = AtomicU64::new(0);
+    // server-side keepalive: probe silent clients and drop dead ones, so
+    // clients that wait for *our* pings (instead of sending their own) do
+    // not hit "timed out waiting for a ping response"
+    let mut last_seen = tokio::time::Instant::now();
+    let mut pinged = false;
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = keepalive.tick() => {
+                let idle = last_seen.elapsed();
+                if idle >= std::time::Duration::from_secs(480) {
+                    tracing::info!(%peer, "ping timeout, closing connection");
+                    let _ = framed.send(srv(server, Command::ERROR("Ping timeout: 480 seconds".into()))).await;
+                    return Ok(());
+                }
+                if idle >= std::time::Duration::from_secs(90) && !pinged {
+                    let token = format!("m2078.{}", last_seen.elapsed().as_secs());
+                    framed.send(srv(server, Command::PING(server.to_owned(), Some(token)))).await?;
+                    pinged = true;
+                }
+            }
             maybe = rx.recv() => {
                 match maybe {
                     Some(m) => send_out(framed, caps, m).await?,
@@ -631,6 +652,8 @@ async fn relay_loop<S: ClientStream>(
                     tracing::info!(%peer, "client hung up");
                     return Ok(());
                 };
+                last_seen = tokio::time::Instant::now();
+                pinged = false;
                 let msg = msg.map_err(|e| anyhow::anyhow!("decode error: {e}"))?;
                 tracing::debug!(command = ?msg.command, "irc line in");
                 let known_channel = |chan: &str| -> bool {
