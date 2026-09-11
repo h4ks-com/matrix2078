@@ -76,6 +76,7 @@ pub async fn run(cfg: Arc<Config>) -> Result<()> {
     let media = Arc::new(MediaServer::new(
         cfg.media_listen,
         crate::matrix::media::cache_dir(&cfg.state_dir),
+        cfg.media_public_url.clone(),
     ));
     {
         let media = Arc::clone(&media);

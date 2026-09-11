@@ -29,19 +29,34 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub struct MediaServer {
     listen: SocketAddr,
+    /// Base URL used in generated links (`http://<listen>` unless a public
+    /// URL is configured — containers sit behind port mappings).
+    url_base: String,
+    /// `host[:port]` the Host header must match (authority of `url_base`).
+    expected_host: String,
     dir: PathBuf,
     key: Vec<u8>,
 }
 
 impl MediaServer {
-    pub fn new(listen: SocketAddr, dir: PathBuf) -> Self {
+    pub fn new(listen: SocketAddr, dir: PathBuf, public_url: Option<String>) -> Self {
         let key = load_or_create_secret(&dir);
-        Self { listen, dir, key }
+        let url_base = public_url
+            .map(|u| u.trim_end_matches('/').to_owned())
+            .unwrap_or_else(|| format!("http://{listen}"));
+        let expected_host = url_base
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        Self { listen, url_base, expected_host, dir, key }
     }
 
     /// A signed URL for a cached file (no expiry: links live in IRC backlogs).
     pub fn url_for(&self, file_name: &str) -> String {
-        format!("http://{}/{}?s={}", self.listen, file_name, self.sign(file_name))
+        format!("{}/{}?s={}", self.url_base, file_name, self.sign(file_name))
     }
 
     fn sign(&self, file_name: &str) -> String {
@@ -97,15 +112,15 @@ impl MediaServer {
         let method = parts.next().unwrap_or("");
         let target = parts.next().unwrap_or("");
 
-        // Host must match the configured listen address: blocks DNS rebinding
-        // and foreign-origin access when listening beyond loopback.
+        // Host must match the public URL authority (or the listen address):
+        // blocks DNS rebinding and foreign-origin access when listening
+        // beyond loopback.
         let host = lines
             .find_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned())))
             .filter(|(k, _)| k == "host")
             .map(|(_, v)| v);
-        let expected_host = self.listen.to_string();
         let host_ok = match host.as_deref() {
-            Some(h) => h.eq_ignore_ascii_case(&expected_host),
+            Some(h) => h.eq_ignore_ascii_case(&self.expected_host),
             None => false,
         };
         if !host_ok {
@@ -285,7 +300,7 @@ mod tests {
         std::fs::write(dir.path().join("evil.html"), b"<script>bad()</script>").unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let srv = Arc::new(MediaServer::new(addr, dir.path().to_path_buf()));
+        let srv = Arc::new(MediaServer::new(addr, dir.path().to_path_buf(), None));
         tokio::spawn(Arc::clone(&srv).run_on(listener));
 
         // valid signed url
@@ -329,6 +344,30 @@ mod tests {
         // unknown file
         let resp = http_get(addr, "/nope.png", None).await;
         assert!(resp.starts_with("HTTP/1.1 403"));
+    }
+
+    #[tokio::test]
+    async fn public_url_overrides_links_and_host_check() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("y.png"), b"png").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = Arc::new(MediaServer::new(
+            addr,
+            dir.path().to_path_buf(),
+            Some("http://media.example.com:8443/".to_owned()),
+        ));
+        tokio::spawn(Arc::clone(&srv).run_on(listener));
+
+        let url = srv.url_for("y.png");
+        assert!(url.starts_with("http://media.example.com:8443/y.png?s="), "{url}");
+        let target = format!("/y.png?s={}", srv.sign("y.png"));
+        // Host matching the public authority passes …
+        let resp = http_get(addr, &target, Some("media.example.com:8443")).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        // … while the raw bind address no longer does.
+        let resp = http_get(addr, &target, None).await;
+        assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
     }
 
     #[test]

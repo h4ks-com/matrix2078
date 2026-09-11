@@ -1,0 +1,29 @@
+# matrix2078 in Docker — drop into the host's irc/ services folder.
+# The image is published by GitHub Actions: ghcr.io/h4ks-com/matrix2078:latest
+
+services:
+  matrix2078:
+    image: ghcr.io/h4ks-com/matrix2078:latest
+    restart: unless-stopped
+    ports:
+      - "6697:2078" # IRC, TLS (POINT AN IRC CLIENT HERE)
+      - "2079:2079" # media (signed links)
+    environment:
+      # inside the container we must bind non-loopback for the port map
+      MATRIX2078_LISTEN: 0.0.0.0:2078
+      MATRIX2078_MEDIA_LISTEN: 0.0.0.0:2079
+      # how IRC clients reach the media server (used in pasted links)
+      MATRIX2078_MEDIA_PUBLIC_URL: http://irc.example.com:2079
+      MATRIX2078_SERVER_NAME: irc.example.com
+      # homeserver for first logins; bare domains go through
+      # well-known -> _matrix._tcp SRV -> https://domain
+      MATRIX2078_HOMESERVER: https://matrix.example.com
+      # allow creating sessions on first login (the IRC password IS the
+      # Matrix password); can be dropped once every user has connected once
+      MATRIX2078_ALLOW_REGISTER: "1"
+      # TLS: PEM cert chain + key (e.g. renewed by acme into ./certs)
+      MATRIX2078_TLS_CERT: /certs/fullchain.pem
+      MATRIX2078_TLS_KEY: /certs/privkey.pem
+    volumes:
+      - ./matrix2078-data:/data
+      - ./certs:/certs:ro

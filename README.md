@@ -69,6 +69,26 @@ through well-known → `_matrix._tcp` SRV → `https://domain`), and an
 **optional TLS listener** for non-loopback hosting (`[tls] cert/key` in
 `matrix2078.toml`, self-signed-friendly).
 
+M6: **voidbar compatibility pass** — a voidbar instance (Discord bouncer,
+girc upstream) runs against matrix2078 end-to-end: `irc://` connection
+strings as invites, full CAP negotiation, the JOIN burst maps to
+guilds/channels, messages relay both ways, reactions ride IRCv3, and a
+single upstream connection is kept alive (`dev/vbtest.ps1`).
+
+## Deployment
+
+Prebuilt container, published by GitHub Actions on every push to `main`:
+
+```console
+docker pull ghcr.io/h4ks-com/matrix2078:latest
+```
+
+See `deploy/docker-compose.example.yml` for a ready compose file (TLS IRC
+on 6697, signed media links on a public URL, persistent `/data` volume).
+The IRC server password **is** the Matrix password; first-time logins need
+`MATRIX2078_ALLOW_REGISTER=1` (or `--allow-register`), later reconnects
+restore the persisted encrypted session.
+
 ## Usage
 
 ```

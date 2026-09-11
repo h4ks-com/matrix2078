@@ -16,6 +16,9 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Address the local media HTTP server listens on.
     pub media_listen: SocketAddr,
+    /// Public base URL for media links, when the server is reachable at a
+    /// different address than it listens on (containers behind port maps).
+    pub media_public_url: Option<String>,
     /// IRC server name shown in numerics and prefixes.
     pub server_name: String,
     /// Directory for persistent (encrypted) sessions and matrix-sdk state.
@@ -56,6 +59,7 @@ impl Default for Config {
         Self {
             listen: SocketAddr::from(([127, 0, 0, 1], 2078)),
             media_listen: SocketAddr::from(([127, 0, 0, 1], 2079)),
+            media_public_url: None,
             server_name: "matrix2078".to_owned(),
             state_dir: PathBuf::from("./state"),
             homeserver: None,
@@ -101,6 +105,9 @@ impl Config {
         }
         if let Some(v) = env_parse::<SocketAddr>("MATRIX2078_MEDIA_LISTEN") {
             self.media_listen = v;
+        }
+        if let Some(v) = env_str("MATRIX2078_MEDIA_PUBLIC_URL") {
+            self.media_public_url = Some(v);
         }
         if let Some(v) = env_str("MATRIX2078_SERVER_NAME") {
             self.server_name = v;
