@@ -97,7 +97,7 @@ pub async fn login_or_restore(
         if !cfg.allow_register {
             bail!(
                 "no stored session for nick {nick:?}; start matrix2078 with --allow-register \
-                 (or MATRIX2078_ALLOW_REGISTER=1) to create one"
+                 (or MATRIX2078_ALLOW_REGISTER=true) to create one"
             );
         }
         let homeserver = hs_override

@@ -20,7 +20,7 @@ services:
       MATRIX2078_HOMESERVER: https://matrix.example.com
       # allow creating sessions on first login (the IRC password IS the
       # Matrix password); can be dropped once every user has connected once
-      MATRIX2078_ALLOW_REGISTER: "1"
+      MATRIX2078_ALLOW_REGISTER: "true"
       # TLS: PEM cert chain + key (e.g. renewed by acme into ./certs)
       MATRIX2078_TLS_CERT: /certs/fullchain.pem
       MATRIX2078_TLS_KEY: /certs/privkey.pem
