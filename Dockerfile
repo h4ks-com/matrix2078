@@ -12,7 +12,7 @@ COPY src ./src
 RUN touch src/main.rs src/bin/e2e_peer.rs \
  && cargo build --release --bin matrix2078
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
