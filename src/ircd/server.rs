@@ -779,7 +779,20 @@ async fn relay_loop<S: ClientStream>(
                     }
                     Command::WHO(Some(mask), _) => {
                         if known_channel(&mask) {
-                            send_who(framed, server, nick, &mask, bridge, names_limit).await?;
+                            // fetch members off the read loop: a slow
+                            // homeserver must not stall PING/PONG
+                            let bridge2 = Arc::clone(bridge);
+                            let tx = echo_tx.clone();
+                            let server2 = server.to_owned();
+                            let nick2 = nick.to_owned();
+                            let mask2 = mask.clone();
+                            let lim = names_limit;
+                            tokio::spawn(async move {
+                                let members = bridge2.channel_members(&mask2).await.unwrap_or_default();
+                                for m in who_messages(&server2, &nick2, &mask2, &members, lim) {
+                                    let _ = tx.send(m).await;
+                                }
+                            });
                         } else {
                             framed.send(num(server, Response::RPL_ENDOFWHO, nick, vec![
                                 mask,
@@ -801,7 +814,18 @@ async fn relay_loop<S: ClientStream>(
                     Command::NAMES(Some(chans), _) => {
                         for chan in chans.split(',').filter(|c| !c.is_empty()) {
                             if known_channel(chan) {
-                                send_names(framed, server, nick, chan, bridge, names_limit).await?;
+                                let bridge2 = Arc::clone(bridge);
+                                let tx = echo_tx.clone();
+                                let server2 = server.to_owned();
+                                let nick2 = nick.to_owned();
+                                let chan2 = chan.to_owned();
+                                let lim = names_limit;
+                                tokio::spawn(async move {
+                                    let members = bridge2.channel_members(&chan2).await.unwrap_or_default();
+                                    for m in names_messages(&server2, &nick2, &chan2, members, lim) {
+                                        let _ = tx.send(m).await;
+                                    }
+                                });
                             } else {
                                 framed.send(num(server, Response::RPL_ENDOFNAMES, nick, vec![
                                     chan.to_owned(),
@@ -939,7 +963,21 @@ async fn relay_loop<S: ClientStream>(
                         return Ok(());
                     }
                     Command::Raw(cmd, args) if cmd.eq_ignore_ascii_case("CHATHISTORY") => {
-                        handle_chathistory(framed, server, nick, bridge, caps, &batch_counter, &args).await?;
+                        // fetch history off the read loop: federated /messages
+                        // can take tens of seconds and must not stall PINGs
+                        let bridge2 = Arc::clone(bridge);
+                        let tx = echo_tx.clone();
+                        let server2 = server.to_owned();
+                        let nick2 = nick.to_owned();
+                        let caps2 = caps.clone();
+                        let ref_id = format!("ch{}", batch_counter.fetch_add(1, Ordering::Relaxed));
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                handle_chathistory(tx, &server2, &nick2, &bridge2, &caps2, ref_id, args).await
+                            {
+                                tracing::warn!(error = %e, "chathistory failed");
+                            }
+                        });
                     }
                     Command::Response(..) | Command::Raw(..) => {}
                     other => {
@@ -1080,21 +1118,21 @@ fn fail_chathistory(server: &str, _nick: &str, code: &str, target: &str, ctx: &s
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_chathistory<S: ClientStream>(
-    framed: &mut Frame<S>,
+async fn handle_chathistory(
+    tx: mpsc::Sender<Message>,
     server: &str,
     nick: &str,
     bridge: &Arc<Bridge>,
     caps: &Caps,
-    counter: &AtomicU64,
-    args: &[String],
+    ref_id: String,
+    args: Vec<String>,
 ) -> Result<()> {
-    let query = match parse_chathistory(args) {
+    let query = match parse_chathistory(&args) {
         Some(q) => q,
         None => {
-            framed
+            let _ = tx
                 .send(fail_chathistory(server, nick, "INVALID_PARAMS", "*", "invalid parameters"))
-                .await?;
+                .await;
             return Ok(());
         }
     };
@@ -1115,7 +1153,7 @@ async fn handle_chathistory<S: ClientStream>(
         }
     };
 
-    let ref_id = format!("ch{}", counter.fetch_add(1, Ordering::Relaxed));
+    let ref_id = ref_id;
     let batch_open = |target: &str| -> Message {
         srv(server, Command::Raw("BATCH".to_owned(), vec![
             format!("+{ref_id}"),
@@ -1141,17 +1179,17 @@ async fn handle_chathistory<S: ClientStream>(
                 .map(|e| format!("{};{};{}", e.channel, 0, now))
                 .collect();
             items.push("End of CHATHISTORY TARGETS".to_owned());
-            framed
+            let _ = tx
                 .send(srv(server, Command::Raw("272".to_owned(), {
                     let mut v = vec![nick.to_owned()];
                     v.extend(items);
                     v
                 })))
-                .await?;
+                .await;
         }
         ChathistoryQuery::Before { target, restriction, limit } => {
             let Some((channel, room)) = target_of(&target) else {
-                framed.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "no such target")).await?;
+                let _ = tx.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "no such target")).await;
                 return Ok(());
             };
             let items: Vec<HistoryItem> = match restriction {
@@ -1160,26 +1198,26 @@ async fn handle_chathistory<S: ClientStream>(
                 Restriction::Any => history::latest(&room, limit).await.unwrap_or_default(),
             };
             let _ = caps;
-            send_history(framed, batch_open(&channel), batch_close, &channel, &items).await?;
+            send_history(tx, batch_open(&channel), batch_close, &channel, &items).await;
         }
         ChathistoryQuery::After { target, restriction, limit } => {
             let Some((channel, room)) = target_of(&target) else {
-                framed.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "no such target")).await?;
+                let _ = tx.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "no such target")).await;
                 return Ok(());
             };
             let items: Vec<HistoryItem> = match restriction {
                 Restriction::Msgid(anchor) => history::around_msgid(&room, &anchor, 0, limit).await.map(|(_, a)| a).unwrap_or_default(),
                 Restriction::Timestamp(_) => {
-                    framed.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "timestamp anchors unsupported for AFTER")).await?;
+                    let _ = tx.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "timestamp anchors unsupported for AFTER")).await;
                     return Ok(());
                 }
                 Restriction::Any => history::latest(&room, limit).await.unwrap_or_default(),
             };
-            send_history(framed, batch_open(&channel), batch_close, &channel, &items).await?;
+            send_history(tx, batch_open(&channel), batch_close, &channel, &items).await;
         }
         ChathistoryQuery::Latest { target, restriction, limit } => {
             let Some((channel, room)) = target_of(&target) else {
-                framed.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "no such target")).await?;
+                let _ = tx.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "no such target")).await;
                 return Ok(());
             };
             let items: Vec<HistoryItem> = match restriction {
@@ -1187,17 +1225,17 @@ async fn handle_chathistory<S: ClientStream>(
                 Restriction::Timestamp(ts) => history::latest_since(&room, ts, limit).await.unwrap_or_default(),
                 Restriction::Any => history::latest(&room, limit).await.unwrap_or_default(),
             };
-            send_history(framed, batch_open(&channel), batch_close, &channel, &items).await?;
+            send_history(tx, batch_open(&channel), batch_close, &channel, &items).await;
         }
         ChathistoryQuery::Between { target, start, end, limit } => {
             let Some((channel, room)) = target_of(&target) else {
-                framed.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "no such target")).await?;
+                let _ = tx.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "no such target")).await;
                 return Ok(());
             };
             let (start_anchor, end_ts) = match (start, end) {
                 (Restriction::Msgid(a), Restriction::Msgid(b)) => (a, b),
                 _ => {
-                    framed.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "BETWEEN requires msgid anchors")).await?;
+                    let _ = tx.send(fail_chathistory(server, nick, "MESSAGE_ERROR", &target, "BETWEEN requires msgid anchors")).await;
                     return Ok(());
                 }
             };
@@ -1208,26 +1246,25 @@ async fn handle_chathistory<S: ClientStream>(
                 .unwrap_or_default();
             items.truncate(limit);
             let _ = end_ts;
-            send_history(framed, batch_open(&channel), batch_close, &channel, &items).await?;
+            send_history(tx, batch_open(&channel), batch_close, &channel, &items).await;
         }
     }
     Ok(())
 }
 
-async fn send_history<S: ClientStream>(
-    framed: &mut Frame<S>,
+async fn send_history(
+    tx: mpsc::Sender<Message>,
     open: Message,
     close: Message,
     channel: &str,
     items: &[HistoryItem],
-) -> Result<()> {
+) {
     let msgs = history::to_irc(channel, items);
-    framed.send(open).await?;
+    let _ = tx.send(open).await;
     for m in msgs {
-        framed.send(m).await?;
+        let _ = tx.send(m).await;
     }
-    framed.send(close).await?;
-    Ok(())
+    let _ = tx.send(close).await;
 }
 
 async fn send_quit<S: ClientStream>(
@@ -1512,32 +1549,16 @@ fn names_messages(
     out
 }
 
-async fn send_names<S: ClientStream>(
-    framed: &mut Frame<S>,
+fn who_messages(
     server: &str,
     nick: &str,
     channel: &str,
-    bridge: &Arc<Bridge>,
+    members: &[String],
     names_limit: usize,
-) -> Result<()> {
-    let members = bridge.channel_members(channel).await.unwrap_or_default();
-    for m in names_messages(server, nick, channel, members, names_limit) {
-        framed.send(m).await?;
-    }
-    Ok(())
-}
-
-async fn send_who<S: ClientStream>(
-    framed: &mut Frame<S>,
-    server: &str,
-    nick: &str,
-    channel: &str,
-    bridge: &Arc<Bridge>,
-    names_limit: usize,
-) -> Result<()> {
-    let members = bridge.channel_members(channel).await.unwrap_or_default();
+) -> Vec<Message> {
+    let mut out = Vec::new();
     for member in members.iter().take(names_limit) {
-        framed.send(num(server, Response::RPL_WHOREPLY, nick, vec![
+        out.push(num(server, Response::RPL_WHOREPLY, nick, vec![
             channel.to_owned(),
             member.clone(),
             "matrix".to_owned(),
@@ -1545,13 +1566,13 @@ async fn send_who<S: ClientStream>(
             member.clone(),
             "H".to_owned(),
             format!("0 matrix user {member}"),
-        ])).await?;
+        ]));
     }
-    framed.send(num(server, Response::RPL_ENDOFWHO, nick, vec![
+    out.push(num(server, Response::RPL_ENDOFWHO, nick, vec![
         channel.to_owned(),
         "End of WHO list".to_owned(),
-    ])).await?;
-    Ok(())
+    ]));
+    out
 }
 
 /// Dispatch a control command sent to the `&matrix` pseudo-client and reply

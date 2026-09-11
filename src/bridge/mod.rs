@@ -267,8 +267,15 @@ impl Bridge {
                     if sender == own
                         && sent.lock().expect("sent mutex").contains(&ev.event_id.to_string())
                     {
+                        tracing::debug!(event = %ev.event_id, "dropping own echo already shown via echo-message");
                         return;
                     }
+                    tracing::info!(
+                        sender = %sender,
+                        room = room.room_id().as_str(),
+                        event = %ev.event_id,
+                        "relaying matrix message"
+                    );
 
                     // in-room verification requests: route to the &matrix flow
                     if let MessageType::VerificationRequest(_) = &ev.content.msgtype {
