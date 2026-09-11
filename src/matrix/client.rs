@@ -51,16 +51,16 @@ async fn build_client(homeserver: &str, sqlite_dir: &Path) -> Result<Client> {
 ///
 /// `login_user` is the Matrix user id (or localpart) used for a fresh login:
 /// taken from the USER field when it looks like an mxid, else the nick.
-/// `hs_override` (GECOS/config/env) wins over the stored homeserver.
-/// State key for a login: mxid localpart when `login_user` is a full mxid
-/// (keeps SASL `@user:domain` and nick-based logins on the same session),
-/// else the nick.
-pub fn state_key(nick: &str, login_user: &str) -> String {
-    login_user
-        .trim_start_matches('@')
-        .split_once(':')
-        .map(|(local, _)| local.to_owned())
-        .unwrap_or_else(|| nick.to_owned())
+/// State key for a login: the mxid localpart. Accepts a full `@user:domain`
+/// (SASL style) or a bare localpart — with the homeserver fixed in config
+/// they denote the same user, so both map to the same persistent session,
+/// independent of the IRC nick.
+pub fn state_key(login_user: &str) -> String {
+    let local = login_user.trim_start_matches('@');
+    match local.split_once(':') {
+        Some((name, _)) => name.to_owned(),
+        None => local.to_owned(),
+    }
 }
 
 /// Restore a stored session for `nick`, or log in with the IRC password and
@@ -68,22 +68,23 @@ pub fn state_key(nick: &str, login_user: &str) -> String {
 ///
 /// `login_user` is the Matrix user id (or localpart) used for a fresh login:
 /// taken from the USER field when it looks like an mxid, else the nick.
-/// `hs_override` (GECOS/config/env) wins over the stored homeserver.
+///
+/// The homeserver comes from config/env only (fresh logins) or from the
+/// stored session (restores): a client-supplied realname (GECOS) must NOT
+/// be able to redirect it, or the instance becomes an open Matrix proxy —
+/// one of matrix2051's explicit non-goals ("being a hosted service").
 pub async fn login_or_restore(
     cfg: &Config,
     nick: &str,
     irc_pass: &str,
     login_user: &str,
-    hs_override: Option<&str>,
 ) -> Result<Client> {
-    let dir = user_dir(&cfg.state_dir, &state_key(nick, login_user));
+    let dir = user_dir(&cfg.state_dir, &state_key(login_user));
     let sqlite_dir = dir.join("sqlite");
 
     if super::session::session_path(&dir).exists() {
         let ps: PersistedSession = load(&dir, irc_pass)?;
-        let homeserver = hs_override
-            .map(str::to_owned)
-            .unwrap_or_else(|| cfg.homeserver.clone().unwrap_or(ps.homeserver.clone()));
+        let homeserver = cfg.homeserver.clone().unwrap_or(ps.homeserver.clone());
         let client = build_client(&homeserver, &sqlite_dir).await?;
         let user_id = ps.session.meta.user_id.clone();
         client
@@ -100,15 +101,11 @@ pub async fn login_or_restore(
                  (or MATRIX2078_ALLOW_REGISTER=true) to create one"
             );
         }
-        let homeserver = hs_override
-            .map(str::to_owned)
-            .or_else(|| cfg.homeserver.clone())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "homeserver not configured; set it in matrix2078.toml, \
-                     MATRIX2078_HOMESERVER, or the IRC realname (GECOS) field"
-                )
-            })?;
+        let homeserver = cfg.homeserver.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "homeserver not configured; set it in matrix2078.toml or MATRIX2078_HOMESERVER"
+            )
+        })?;
         let client = build_client(&homeserver, &sqlite_dir).await?;
         client
             .matrix_auth()
@@ -133,6 +130,16 @@ pub async fn login_or_restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_key_maps_to_localpart() {
+        // full mxid (SASL) and bare localpart are the same session, and the
+        // IRC nick never leaks into the key
+        assert_eq!(state_key("@alice:doesnmlab.xyz"), "alice");
+        assert_eq!(state_key("alice"), "alice");
+        assert_eq!(state_key("bob"), "bob");
+        assert_eq!(state_key("@with.digits-1:x.org"), "with.digits-1");
+    }
 
     #[test]
     fn user_dir_sanitizes() {

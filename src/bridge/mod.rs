@@ -77,11 +77,10 @@ impl Bridge {
         nick: &str,
         irc_pass: &str,
         login_user: &str,
-        hs_override: Option<&str>,
         media: Arc<MediaServer>,
         caps: Caps,
     ) -> Result<Arc<Self>> {
-        let client = login_or_restore(cfg, nick, irc_pass, login_user, hs_override).await?;
+        let client = login_or_restore(cfg, nick, irc_pass, login_user).await?;
 
         client
             .sync_once(SyncSettings::default().ignore_timeout_on_first_sync(true))
@@ -93,7 +92,7 @@ impl Bridge {
             .ok_or_else(|| anyhow::anyhow!("client has no user id after sync"))?;
         let hub = VerificationHub::new(client.clone(), own_mxid.clone(), nick);
 
-        let maps_path = channels_path(&cfg.state_dir, &crate::matrix::client::state_key(nick, login_user));
+        let maps_path = channels_path(&cfg.state_dir, &crate::matrix::client::state_key(login_user));
         let rooms = Arc::new(Mutex::new(RoomMaps::load(maps_path)));
         let live: HashSet<OwnedRoomId> =
             client.joined_rooms().iter().map(|r| r.room_id().to_owned()).collect();

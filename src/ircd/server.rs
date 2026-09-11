@@ -335,20 +335,10 @@ async fn handle_authenticate<S: ClientStream>(
     Ok(())
 }
 
-/// Parse a homeserver hint out of the GECOS (realname) field, matrix2051-style:
-/// accepts `https://host`, `http://host` or a bare `host` (the bare form goes
-/// through full spec discovery: well-known → `_matrix._tcp` SRV → https).
-fn gecos_homeserver(realname: Option<&str>) -> Option<String> {
-    let raw = realname?.trim();
-    let has_scheme = raw.starts_with("https://") || raw.starts_with("http://");
-    if raw.is_empty() || raw.contains(char::is_whitespace) || (!has_scheme && !raw.contains('.')) {
-        return None;
-    }
-    Some(raw.trim_end_matches('/').to_owned())
-}
-
 /// Sanitize the USER field into a sane IRC username: if it is a full mxid,
 /// use its localpart; keep only irc-username-safe characters.
+/// The realname (GECOS) is ignored on purpose: a client-supplied homeserver
+/// would turn the instance into an open Matrix proxy (matrix2051 non-goal).
 fn irc_username(raw: &str) -> String {
     let local = if raw.contains('@') {
         raw.trim_start_matches('@').split(['@', ':']).next().unwrap_or("u")
@@ -374,22 +364,6 @@ mod tests {
         assert_eq!(irc_username("weechat"), "weechat");
         assert_eq!(irc_username("has spaces"), "has_spaces");
         assert_eq!(irc_username(":::"), "u");
-    }
-
-    #[test]
-    fn gecos_homeserver_parsing() {
-        assert_eq!(
-            gecos_homeserver(Some("https://matrix.doesnmlab.xyz")).as_deref(),
-            Some("https://matrix.doesnmlab.xyz")
-        );
-        assert_eq!(
-            gecos_homeserver(Some("matrix.doesnmlab.xyz/")).as_deref(),
-            Some("matrix.doesnmlab.xyz")
-        );
-        assert_eq!(gecos_homeserver(Some("http://localhost:8008")).as_deref(), Some("http://localhost:8008"));
-        assert_eq!(gecos_homeserver(Some("just a guy")), None);
-        assert_eq!(gecos_homeserver(Some("nodots")), None);
-        assert_eq!(gecos_homeserver(None), None);
     }
 
     #[test]
@@ -1268,10 +1242,8 @@ async fn matrix_auth<S: ClientStream>(
                 .cloned()
         })
         .unwrap_or_else(|| nick.clone());
-    let hs = gecos_homeserver(reg.realname.as_deref());
-
-    tracing::info!(nick = %nick, homeserver = ?hs, sasl = reg.sasl_user.is_some(), "authenticating against matrix");
-    let connect = Bridge::connect(cfg, &nick, &pass, &login_user, hs.as_deref(), Arc::clone(media), reg.caps.clone());
+    tracing::info!(nick = %nick, homeserver = ?cfg.homeserver, sasl = reg.sasl_user.is_some(), "authenticating against matrix");
+    let connect = Bridge::connect(cfg, &nick, &pass, &login_user, Arc::clone(media), reg.caps.clone());
     match tokio::time::timeout(std::time::Duration::from_secs(120), connect).await {
         Ok(Ok(bridge)) => Ok(Some(bridge)),
         Ok(Err(e)) => {

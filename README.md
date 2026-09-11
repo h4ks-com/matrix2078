@@ -35,8 +35,8 @@ access token, cached locally and served at stable signed
 `http://127.0.0.1:2079/...` URLs), and capped NAMES/WHO replies so
 thousand-member rooms don't freeze IRC clients.
 
-M2 adds IRCv3: capability negotiation, **SASL PLAIN** (user = full
-`@user:domain`, password = Matrix password), **server-time** + `msgid` tags
+M2 adds IRCv3: capability negotiation, **SASL PLAIN** (user = `@user:domain`
+or just the localpart, password = Matrix password), **server-time** + `msgid` tags
 (event ids, used as chathistory anchors), **echo-message**, **draft/multiline**
 batches both ways (with word-wrap downgrade for legacy clients),
 **draft/chathistory** (LATEST/BEFORE/AFTER/BETWEEN/TARGETS via Matrix
@@ -64,7 +64,7 @@ chats surface as private messages from the other party's nick — both ways,
 with the DM created on first contact if needed), **room invitations** are
 prompted over IRC (`/msg &matrix accept|decline <n>`, with offline invites
 surfacing on connect; accepted channel rooms get their JOIN burst
-immediately), **homeserver discovery** (a bare domain in config/GECOS goes
+immediately), **homeserver discovery** (a bare domain in config goes
 through well-known → `_matrix._tcp` SRV → `https://domain`), and an
 **optional TLS listener** for non-loopback hosting (`[tls] cert/key` in
 `matrix2078.toml`, self-signed-friendly).
@@ -99,11 +99,14 @@ Then connect an IRC client to `127.0.0.1:2078`:
 
 - **server password** (or SASL PLAIN): your Matrix account password
 - **nick**: your Matrix localpart (e.g. `m2078` for `@m2078:example.org`)
-- **SASL username**: full `@user:domain` mxid (recommended; also used for
-  the first login)
+- **SASL username**: full `@user:domain` mxid or just the localpart (both
+  map to the same persistent session)
 - **username** (optional): full `@user:domain` for the first login
-- **realname** (GECOS): your homeserver URL, matrix2051-style (optional if
-  configured in `matrix2078.toml`)
+
+The homeserver is taken from `matrix2078.toml` / `MATRIX2078_HOMESERVER`
+only — never from client-supplied fields — so an instance with open
+registration stays limited to the configured homeserver's accounts (see
+matrix2051's non-goal "being a hosted service").
 
 Every joined room appears as an IRC channel automatically. The Matrix
 session (tokens + state) is stored encrypted under `state/` (keyed by argon2
