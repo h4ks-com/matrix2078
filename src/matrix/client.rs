@@ -46,11 +46,6 @@ async fn build_client(homeserver: &str, sqlite_dir: &Path) -> Result<Client> {
         .map_err(|e| anyhow::anyhow!("building matrix client for {homeserver}: {e}"))
 }
 
-/// Restore a stored session for `nick`, or log in with the IRC password and
-/// persist the new session (only when registration is allowed).
-///
-/// `login_user` is the Matrix user id (or localpart) used for a fresh login:
-/// taken from the USER field when it looks like an mxid, else the nick.
 /// State key for a login: the mxid localpart. Accepts a full `@user:domain`
 /// (SASL style) or a bare localpart — with the homeserver fixed in config
 /// they denote the same user, so both map to the same persistent session,
@@ -64,7 +59,10 @@ pub fn state_key(login_user: &str) -> String {
 }
 
 /// Restore a stored session for `nick`, or log in with the IRC password and
-/// persist the new session (only when registration is allowed).
+/// persist the new session. Whether a *new* session may be created is not
+/// gated locally: the homeserver is fixed in config, so the homeserver's own
+/// account policy (registration open/closed, password validity) is the only
+/// gate that matters.
 ///
 /// `login_user` is the Matrix user id (or localpart) used for a fresh login:
 /// taken from the USER field when it looks like an mxid, else the nick.
@@ -95,12 +93,6 @@ pub async fn login_or_restore(
         tracing::info!(nick, homeserver, %user_id, "restored matrix session");
         Ok(client)
     } else {
-        if !cfg.allow_register {
-            bail!(
-                "no stored session for nick {nick:?}; start matrix2078 with --allow-register \
-                 (or MATRIX2078_ALLOW_REGISTER=true) to create one"
-            );
-        }
         let homeserver = cfg.homeserver.clone().ok_or_else(|| {
             anyhow::anyhow!(
                 "homeserver not configured; set it in matrix2078.toml or MATRIX2078_HOMESERVER"

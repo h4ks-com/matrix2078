@@ -85,14 +85,15 @@ docker pull ghcr.io/h4ks-com/matrix2078:latest
 
 See `deploy/docker-compose.example.yml` for a ready compose file (TLS IRC
 on 6697, signed media links on a public URL, persistent `/data` volume).
-The IRC server password **is** the Matrix password; first-time logins need
-`MATRIX2078_ALLOW_REGISTER=1` (or `--allow-register`), later reconnects
-restore the persisted encrypted session.
+The IRC server password **is** the Matrix password; a session is created on
+the first successful login and restored (encrypted) on every reconnect.
+Since the homeserver is fixed in config, who may connect is decided by the
+homeserver's own account policy, not by matrix2078.
 
 ## Usage
 
 ```
-cargo run --release -- --allow-register
+cargo run --release
 ```
 
 Then connect an IRC client to `127.0.0.1:2078`:
@@ -111,8 +112,7 @@ matrix2051's non-goal "being a hosted service").
 Every joined room appears as an IRC channel automatically. The Matrix
 session (tokens + state) is stored encrypted under `state/` (keyed by argon2
 + XChaCha20-Poly1305 under your IRC password) and reused on every reconnect
-— no device spam. After the first registration, `--allow-register` is no
-longer needed.
+- no device spam.
 
 ### Verifying devices from IRC
 
@@ -129,8 +129,8 @@ Interactive SAS verification is surfaced through the `&matrix` pseudo-client:
 
 Configuration: `matrix2078.toml` and `MATRIX2078_*` environment variables
 (`MATRIX2078_LISTEN`, `MATRIX2078_MEDIA_LISTEN`, `MATRIX2078_STATE_DIR`,
-`MATRIX2078_HOMESERVER`, `MATRIX2078_NAMES_LIMIT`,
-`MATRIX2078_ALLOW_REGISTER`), plus `RUST_LOG` for log filtering.
+`MATRIX2078_HOMESERVER`, `MATRIX2078_NAMES_LIMIT`), plus `RUST_LOG` for
+log filtering.
 
 ## License
 

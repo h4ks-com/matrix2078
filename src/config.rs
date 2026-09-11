@@ -23,12 +23,10 @@ pub struct Config {
     pub server_name: String,
     /// Directory for persistent (encrypted) sessions and matrix-sdk state.
     pub state_dir: PathBuf,
-    /// Homeserver base URL; used when not given via GECOS in USER.
-    /// Required for the first login of a user, afterwards taken from the
-    /// stored session unless overridden.
+    /// Homeserver base URL (bare domains go through spec discovery).
+    /// Required for the first login of a user, afterwards the stored session
+    /// is reused unless overridden here.
     pub homeserver: Option<String>,
-    /// Allow creating new Matrix sessions from IRC PASS/NICK/USER registration.
-    pub allow_register: bool,
     /// Room↔channel relay tuning.
     pub bridge: BridgeConfig,
     /// Optional TLS for the IRC listener (PEM cert + key), for
@@ -63,7 +61,6 @@ impl Default for Config {
             server_name: "matrix2078".to_owned(),
             state_dir: PathBuf::from("./state"),
             homeserver: None,
-            allow_register: false,
             bridge: BridgeConfig::default(),
             tls: None,
         }
@@ -118,9 +115,6 @@ impl Config {
         if let Some(v) = env_str("MATRIX2078_HOMESERVER") {
             self.homeserver = Some(v);
         }
-        if let Some(v) = env_parse::<bool>("MATRIX2078_ALLOW_REGISTER") {
-            self.allow_register = v;
-        }
         if let Some(v) = env_parse::<usize>("MATRIX2078_NAMES_LIMIT") {
             self.bridge.names_limit = v;
         }
@@ -160,7 +154,6 @@ mod tests {
         assert_eq!(cfg.listen.to_string(), "127.0.0.1:2078");
         assert_eq!(cfg.media_listen.to_string(), "127.0.0.1:2079");
         assert_eq!(cfg.state_dir, PathBuf::from("./state"));
-        assert!(!cfg.allow_register);
         assert_eq!(cfg.bridge.names_limit, 200);
     }
 

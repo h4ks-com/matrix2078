@@ -20,9 +20,6 @@ state_dir = "./state"
 # priority, then this, then the stored session's homeserver.
 # homeserver = "https://matrix.doesnmlab.xyz"
 
-# Allow creating new Matrix sessions from IRC registration.
-# Equivalent to the --allow-register CLI flag.
-allow_register = false
 
 [bridge]
 # Maximum nicks sent in NAMES/353 and WHO/352 replies. Huge Matrix rooms

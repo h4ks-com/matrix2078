@@ -24,11 +24,6 @@ struct Args {
     #[arg(short, long, default_value = "matrix2078.toml")]
     config: PathBuf,
 
-    /// Allow first-time registration of new Matrix sessions
-    /// (login with the IRC server password = Matrix password)
-    #[arg(long)]
-    allow_register: bool,
-
     /// Override the listen address
     #[arg(long)]
     listen: Option<SocketAddr>,
@@ -73,9 +68,6 @@ async fn main() -> ExitCode {
 
 fn load_config(args: &Args) -> anyhow::Result<Config> {
     let mut cfg = Config::load_or_default(&args.config)?;
-    if args.allow_register {
-        cfg.allow_register = true;
-    }
     if let Some(listen) = args.listen {
         cfg.listen = listen;
     }
