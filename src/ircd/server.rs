@@ -17,6 +17,7 @@ use irc::proto::{CapSubCommand, Command, IrcCodec, Message, Prefix, Response};
 use irc::proto::message::Tag;
 use tokio::{net::{TcpListener, TcpStream}, sync::mpsc};
 use tokio_util::codec::Framed;
+use futures::stream::{SplitSink, SplitStream};
 
 use crate::{
     bridge::{Bridge, history::{self, HistoryItem}},
@@ -30,7 +31,7 @@ use crate::{
 };
 
 /// Any accepted client stream: plain TCP or TLS.
-pub trait ClientStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
+pub trait ClientStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {
     fn set_nodelay(&self);
 }
 
@@ -48,7 +49,8 @@ impl ClientStream for tokio_rustls::server::TlsStream<TcpStream> {
 
 /// A framed client connection regardless of transport.
 type Frame<S> = Framed<S, IrcCodec>;
-
+type SinkHalf<S> = SplitSink<Framed<S, IrcCodec>, Message>;
+type StreamHalf<S> = SplitStream<Framed<S, IrcCodec>>;
 pub async fn run(cfg: Arc<Config>) -> Result<()> {
     // ring-backed crypto provider for rustls (ignored if already installed)
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
@@ -128,7 +130,7 @@ fn load_key(path: &std::path::Path) -> Result<tokio_rustls::rustls::pki_types::P
         .ok_or_else(|| anyhow::anyhow!("no private key found in {}", path.display()))
 }
 
-async fn handle_conn<S: ClientStream>(
+async fn handle_conn<S: ClientStream + 'static>(
     stream: S,
     peer: SocketAddr,
     cfg: Arc<Config>,
@@ -189,13 +191,29 @@ async fn handle_conn<S: ClientStream>(
     let prefix = client_prefix(&nick, &username);
 
     for m in welcome_burst(&server, &nick) {
-        send_out(&mut framed, &caps, m).await?;
+        framed.send(tags_for_client(&caps, m)).await?;
     }
     if reg.sasl_user.is_some() {
         // account-notify base: announce our own account once
         let account = reg.sasl_user.clone().unwrap_or_default();
         let _ = account;
     }
+
+    // dedicated writer with a priority lane: PONG/ERROR must overtake any
+    // backlog of history/NAMES lines, or clients measuring ping round-trips
+    // time out while we are still flushing prefill bursts
+    let (sink, stream) = futures::StreamExt::split(framed);
+    let (prio_tx, prio_rx) = mpsc::channel::<Message>(32);
+    let (tx, rx) = mpsc::channel::<Message>(256);
+    let last_seen = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+    let writer = spawn_writer(
+        sink,
+        caps.clone(),
+        server.clone(),
+        prio_rx,
+        rx,
+        last_seen.clone(),
+    );
 
     // JOIN every already-mapped room's channel before any PRIVMSG can
     // reference it (DM/query mappings surface as private messages, not
@@ -205,7 +223,6 @@ async fn handle_conn<S: ClientStream>(
     // The burst itself also runs in the background: fetching members of
     // federated rooms can take tens of seconds and must not stall the read
     // loop (a client PING would go unanswered and the connection die).
-    let (tx, mut rx) = mpsc::channel::<Message>(256);
     bridge.relay_matrix_to_irc(tx.clone());
     {
         let bridge = Arc::clone(&bridge);
@@ -245,12 +262,88 @@ async fn handle_conn<S: ClientStream>(
     );
 
     let result =
-        relay_loop(&mut framed, &peer, &server, &prefix, &mut nick, &username, &bridge, &caps, &mut rx, tx)
+        relay_loop(stream, &peer, &server, &prefix, &mut nick, &username, &bridge, &caps, &prio_tx, &tx, &last_seen)
             .await;
+    writer.abort();
     // the matrix sync loop must not outlive the IRC connection: it holds the
     // device's sync position and would block the next session of this user
     sync_task.abort();
     result
+}
+
+/// Dedicated connection writer: owns the socket half, always drains the
+/// priority lane (PONG/ERROR) first, keeps the keepalive PING cadence and
+/// drops dead peers.
+fn spawn_writer<S: ClientStream + 'static>(
+    mut sink: SinkHalf<S>,
+    caps: Caps,
+    server: String,
+    mut prio_rx: mpsc::Receiver<Message>,
+    mut rx: mpsc::Receiver<Message>,
+    last_seen: Arc<std::sync::Mutex<tokio::time::Instant>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut pinged = false;
+        let mut seen_at = *last_seen.lock().expect("last_seen mutex");
+        let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                maybe = prio_rx.recv() => {
+                    match maybe {
+                        Some(m) => {
+                            if sink.send(m).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => continue,
+                    }
+                }
+                _ = keepalive.tick() => {
+                    let now_seen = *last_seen.lock().expect("last_seen mutex");
+                    if now_seen != seen_at {
+                        seen_at = now_seen;
+                        pinged = false;
+                    }
+                    let idle = tokio::time::Instant::now() - seen_at;
+                    if idle >= std::time::Duration::from_secs(480) {
+                        tracing::info!("ping timeout, closing connection");
+                        let _ = sink
+                            .send(srv(&server, Command::ERROR("Ping timeout: 480 seconds".into())))
+                            .await;
+                        break;
+                    }
+                    if idle >= std::time::Duration::from_secs(90) && !pinged {
+                        let token = format!("m2078.{}", idle.as_secs());
+                        if sink
+                            .send(srv(&server, Command::PING(server.clone(), Some(token))))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        pinged = true;
+                    }
+                }
+                maybe = rx.recv() => {
+                    match maybe {
+                        Some(m) => {
+                            if sink.send(tags_for_client(&caps, m)).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => {
+                            let _ = sink
+                                .send(srv(&server, Command::ERROR("matrix relay closed".into())))
+                                .await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// CAP negotiation during registration.
@@ -626,7 +719,7 @@ fn tag_value(msg: &Message, name: &str) -> Option<String> {
 
 #[allow(clippy::too_many_arguments)]
 async fn relay_loop<S: ClientStream>(
-    framed: &mut Frame<S>,
+    mut stream: StreamHalf<S>,
     peer: &SocketAddr,
     server: &str,
     prefix: &Prefix,
@@ -634,52 +727,25 @@ async fn relay_loop<S: ClientStream>(
     username: &str,
     bridge: &Arc<Bridge>,
     caps: &Caps,
-    rx: &mut mpsc::Receiver<Message>,
-    echo_tx: mpsc::Sender<Message>,
+    prio_tx: &mpsc::Sender<Message>,
+    tx: &mpsc::Sender<Message>,
+    last_seen: &Arc<std::sync::Mutex<tokio::time::Instant>>,
 ) -> Result<()> {
     let mut prefix = prefix.clone();
     let names_limit = bridge.cfg.bridge.names_limit;
     let mut multiline: HashMap<String, MultiLine> = HashMap::new();
     let batch_counter = AtomicU64::new(0);
-    // server-side keepalive: probe silent clients and drop dead ones, so
-    // clients that wait for *our* pings (instead of sending their own) do
-    // not hit "timed out waiting for a ping response"
-    let mut last_seen = tokio::time::Instant::now();
-    let mut pinged = false;
-    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
-    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let tx = tx.clone();
+    let prio_tx = prio_tx.clone();
     loop {
         tokio::select! {
-            _ = keepalive.tick() => {
-                let idle = last_seen.elapsed();
-                if idle >= std::time::Duration::from_secs(480) {
-                    tracing::info!(%peer, "ping timeout, closing connection");
-                    let _ = framed.send(srv(server, Command::ERROR("Ping timeout: 480 seconds".into()))).await;
-                    return Ok(());
-                }
-                if idle >= std::time::Duration::from_secs(90) && !pinged {
-                    let token = format!("m2078.{}", last_seen.elapsed().as_secs());
-                    framed.send(srv(server, Command::PING(server.to_owned(), Some(token)))).await?;
-                    pinged = true;
-                }
-            }
-            maybe = rx.recv() => {
-                match maybe {
-                    Some(m) => send_out(framed, caps, m).await?,
-                    None => {
-                        framed.send(srv(server, Command::ERROR("matrix relay closed".into()))).await?;
-                        return Ok(());
-                    }
-                }
-            }
-            maybe = framed.next() => {
+            maybe = stream.next() => {
                 let Some(msg) = maybe else {
                     tracing::info!(%peer, "client hung up");
                     return Ok(());
                 };
-                last_seen = tokio::time::Instant::now();
-                pinged = false;
                 let msg = msg.map_err(|e| anyhow::anyhow!("decode error: {e}"))?;
+                *last_seen.lock().expect("last_seen mutex") = tokio::time::Instant::now();
                 tracing::debug!(command = ?msg.command, "irc line in");
                 let known_channel = |chan: &str| -> bool {
                     bridge.rooms.lock().expect("rooms mutex").get_by_channel(chan).is_some()
@@ -730,27 +796,27 @@ async fn relay_loop<S: ClientStream>(
                 let reply_tag = tag_value(&msg, "+draft/reply");
                 match msg.command {
                     Command::PING(token, _) => {
-                        framed.send(srv(server, Command::PONG(server.to_owned(), Some(token)))).await?;
+                        let _ = prio_tx.send(srv(server, Command::PONG(server.to_owned(), Some(token)))).await;
                     }
                     Command::PONG(..) => {}
                     Command::PRIVMSG(target, body) => {
                         if target.eq_ignore_ascii_case(crate::matrix::verification::CONTROL_NICK) {
-                            control_command(framed, caps, server, nick, &prefix, bridge, &body).await?;
+                            control_command(&tx, caps, server, nick, &prefix, bridge, &body).await?;
                         } else if target.starts_with('&') {
                             // other service-ish targets: ignore
                         } else if target.starts_with('#') {
-                            relay_from_irc(bridge, nick, &prefix, &target, body, false, known_channel(&target), is_joined(&target), caps, &echo_tx, reply_tag).await?;
+                            relay_from_irc(bridge, nick, &prefix, &target, body, false, known_channel(&target), is_joined(&target), caps, &tx, reply_tag).await?;
                         } else {
-                            relay_query_from_irc(bridge, nick, &prefix, &target, body, false, caps, &echo_tx, reply_tag).await?;
+                            relay_query_from_irc(bridge, nick, &prefix, &target, body, false, caps, &tx, reply_tag).await?;
                         }
                     }
                     Command::NOTICE(target, body) => {
                         if target.eq_ignore_ascii_case(crate::matrix::verification::CONTROL_NICK) {
-                            control_command(framed, caps, server, nick, &prefix, bridge, &body).await?;
+                            control_command(&tx, caps, server, nick, &prefix, bridge, &body).await?;
                         } else if target.starts_with('&') || target.starts_with('#') {
-                            relay_from_irc(bridge, nick, &prefix, &target, body, true, known_channel(&target), is_joined(&target), caps, &echo_tx, reply_tag).await?;
+                            relay_from_irc(bridge, nick, &prefix, &target, body, true, known_channel(&target), is_joined(&target), caps, &tx, reply_tag).await?;
                         } else {
-                            relay_query_from_irc(bridge, nick, &prefix, &target, body, true, caps, &echo_tx, reply_tag).await?;
+                            relay_query_from_irc(bridge, nick, &prefix, &target, body, true, caps, &tx, reply_tag).await?;
                         }
                     }
                     Command::Raw(ref cmd, ref params) if cmd == "TAGMSG" => {
@@ -791,7 +857,7 @@ async fn relay_loop<S: ClientStream>(
                     }
                     Command::BATCH(ref_name, sub, args) => {
                         let reply_on_open = reply_tag.clone();
-                        handle_batch(framed, server, nick, &prefix, &mut multiline, bridge, caps, &echo_tx, &ref_name, sub, args, reply_on_open).await?;
+                        handle_batch(server, nick, &prefix, &mut multiline, bridge, caps, &tx, &ref_name, sub, args, reply_on_open).await?;
                     }
                     Command::JOIN(chans, _, _) => {
                         for chan in chans.split(',').filter(|c| !c.is_empty()) {
@@ -801,7 +867,7 @@ async fn relay_loop<S: ClientStream>(
                                     .get_by_channel(chan).cloned().expect("checked above");
                                 // member fetch in the background: must not stall PINGs
                                 let bridge2 = Arc::clone(bridge);
-                                let tx = echo_tx.clone();
+                                let tx = tx.clone();
                                 let server2 = server.to_owned();
                                 let nick2 = nick.to_owned();
                                 let prefix2 = prefix.clone();
@@ -813,7 +879,7 @@ async fn relay_loop<S: ClientStream>(
                                     }
                                 });
                             } else {
-                                framed.send(num(server, Response::ERR_NOSUCHCHANNEL, nick, vec![
+                                tx.send(num(server, Response::ERR_NOSUCHCHANNEL, nick, vec![
                                     chan.to_owned(),
                                     "No such channel".to_owned(),
                                 ])).await?;
@@ -824,9 +890,9 @@ async fn relay_loop<S: ClientStream>(
                         for chan in chans.split(',').filter(|c| !c.is_empty()) {
                             if known_channel(chan) {
                                 bridge.joined.lock().expect("joined mutex").remove(&chan.to_ascii_lowercase());
-                                framed.send(from_client(&prefix, Command::PART(chan.to_owned(), comment.clone()))).await?;
+                                tx.send(from_client(&prefix, Command::PART(chan.to_owned(), comment.clone()))).await?;
                             } else {
-                                framed.send(num(server, Response::ERR_NOSUCHCHANNEL, nick, vec![
+                                tx.send(num(server, Response::ERR_NOSUCHCHANNEL, nick, vec![
                                     chan.to_owned(),
                                     "No such channel".to_owned(),
                                 ])).await?;
@@ -838,7 +904,7 @@ async fn relay_loop<S: ClientStream>(
                             // fetch members off the read loop: a slow
                             // homeserver must not stall PING/PONG
                             let bridge2 = Arc::clone(bridge);
-                            let tx = echo_tx.clone();
+                            let tx = tx.clone();
                             let server2 = server.to_owned();
                             let nick2 = nick.to_owned();
                             let mask2 = mask.clone();
@@ -850,7 +916,7 @@ async fn relay_loop<S: ClientStream>(
                                 }
                             });
                         } else {
-                            framed.send(num(server, Response::RPL_ENDOFWHO, nick, vec![
+                            tx.send(num(server, Response::RPL_ENDOFWHO, nick, vec![
                                 mask,
                                 "End of WHO list".to_owned(),
                             ])).await?;
@@ -861,7 +927,7 @@ async fn relay_loop<S: ClientStream>(
                         let chans: Vec<String> =
                             bridge.joined.lock().expect("joined mutex").iter().cloned().collect();
                         for chan in chans {
-                            framed.send(num(server, Response::RPL_ENDOFWHO, nick, vec![
+                            tx.send(num(server, Response::RPL_ENDOFWHO, nick, vec![
                                 chan,
                                 "End of WHO list".to_owned(),
                             ])).await?;
@@ -871,7 +937,7 @@ async fn relay_loop<S: ClientStream>(
                         for chan in chans.split(',').filter(|c| !c.is_empty()) {
                             if known_channel(chan) {
                                 let bridge2 = Arc::clone(bridge);
-                                let tx = echo_tx.clone();
+                                let tx = tx.clone();
                                 let server2 = server.to_owned();
                                 let nick2 = nick.to_owned();
                                 let chan2 = chan.to_owned();
@@ -883,7 +949,7 @@ async fn relay_loop<S: ClientStream>(
                                     }
                                 });
                             } else {
-                                framed.send(num(server, Response::RPL_ENDOFNAMES, nick, vec![
+                                tx.send(num(server, Response::RPL_ENDOFNAMES, nick, vec![
                                     chan.to_owned(),
                                     "End of /NAMES list".to_owned(),
                                 ])).await?;
@@ -898,19 +964,19 @@ async fn relay_loop<S: ClientStream>(
                             }
                             let topic = bridge.rooms.lock().expect("rooms mutex")
                                 .get_by_channel(&chan).map(|e| e.topic.clone()).unwrap_or_default();
-                            framed.send(num(server, Response::RPL_TOPIC, nick, vec![
+                            tx.send(num(server, Response::RPL_TOPIC, nick, vec![
                                 chan,
                                 topic,
                             ])).await?;
                         } else {
-                            framed.send(num(server, Response::ERR_NOSUCHCHANNEL, nick, vec![
+                            tx.send(num(server, Response::ERR_NOSUCHCHANNEL, nick, vec![
                                 chan,
                                 "No such channel".to_owned(),
                             ])).await?;
                         }
                     }
                     Command::LIST(chans, _) => {
-                        framed.send(num(server, Response::RPL_LISTSTART, nick, vec!["Channel :Users  Name".to_owned()])).await?;
+                        tx.send(num(server, Response::RPL_LISTSTART, nick, vec!["Channel :Users  Name".to_owned()])).await?;
                         let entries = bridge.entries();
                         let wanted: Vec<String> = chans
                             .map(|c| c.split(',').map(str::to_owned).collect())
@@ -922,31 +988,31 @@ async fn relay_loop<S: ClientStream>(
                                 continue;
                             }
                             let members = bridge.channel_members(&e.channel).await.unwrap_or_default().len();
-                            framed.send(num(server, Response::RPL_LIST, nick, vec![
+                            tx.send(num(server, Response::RPL_LIST, nick, vec![
                                 e.channel.clone(),
                                 members.to_string(),
                                 e.topic.clone(),
                             ])).await?;
                         }
-                        framed.send(num(server, Response::RPL_LISTEND, nick, vec!["End of /LIST".to_owned()])).await?;
+                        tx.send(num(server, Response::RPL_LISTEND, nick, vec!["End of /LIST".to_owned()])).await?;
                     }
                     Command::UserMODE(target, _) => {
                         if target == *nick {
-                            framed.send(num(server, Response::RPL_UMODEIS, nick, vec!["+".to_owned()])).await?;
+                            tx.send(num(server, Response::RPL_UMODEIS, nick, vec!["+".to_owned()])).await?;
                         } else {
-                            framed.send(num(server, Response::ERR_USERSDONTMATCH, nick, vec![
+                            tx.send(num(server, Response::ERR_USERSDONTMATCH, nick, vec![
                                 "Can't change mode for other users".to_owned(),
                             ])).await?;
                         }
                     }
                     Command::ChannelMODE(chan, _) => {
                         if known_channel(&chan) {
-                            framed.send(num(server, Response::RPL_CHANNELMODEIS, nick, vec![
+                            tx.send(num(server, Response::RPL_CHANNELMODEIS, nick, vec![
                                 chan,
                                 "+nt".to_owned(),
                             ])).await?;
                         } else {
-                            framed.send(num(server, Response::ERR_NOSUCHCHANNEL, nick, vec![
+                            tx.send(num(server, Response::ERR_NOSUCHCHANNEL, nick, vec![
                                 chan,
                                 "No such channel".to_owned(),
                             ])).await?;
@@ -954,26 +1020,26 @@ async fn relay_loop<S: ClientStream>(
                     }
                     Command::MOTD(_) => {
                         for m in motd(server, nick) {
-                            send_out(framed, caps, m).await?;
+                            let _ = tx.send(m).await;
                         }
                     }
                     Command::LUSERS(..) => {
                         for m in lusers(server, nick) {
-                            framed.send(m).await?;
+                            tx.send(m).await?;
                         }
                     }
                     Command::AWAY(away) => {
                         let code = if away.is_some() { Response::RPL_NOWAWAY } else { Response::RPL_UNAWAY };
                         let text = if away.is_some() { "You have been marked as being away" } else { "You are no longer marked as being away" };
-                        framed.send(num(server, code, nick, vec![text.to_owned()])).await?;
+                        tx.send(num(server, code, nick, vec![text.to_owned()])).await?;
                     }
                     Command::NICK(new) => {
                         if valid_nick(&new) {
-                            framed.send(from_client(&prefix, Command::NICK(new.clone()))).await?;
+                            tx.send(from_client(&prefix, Command::NICK(new.clone()))).await?;
                             *nick = new;
                             prefix = client_prefix(nick, username);
                         } else {
-                            framed.send(num(server, Response::ERR_ERRONEOUSNICKNAME, nick, vec![
+                            tx.send(num(server, Response::ERR_ERRONEOUSNICKNAME, nick, vec![
                                 new,
                                 "Erroneous nickname".to_owned(),
                             ])).await?;
@@ -999,7 +1065,7 @@ async fn relay_loop<S: ClientStream>(
                             })
                             .cloned()
                             .collect();
-                        framed.send(num(server, Response::RPL_ISON, nick, vec![found.join(" ")])).await?;
+                        tx.send(num(server, Response::RPL_ISON, nick, vec![found.join(" ")])).await?;
                     }
                     Command::USERHOST(list) => {
                         let mut parts = Vec::new();
@@ -1008,10 +1074,13 @@ async fn relay_loop<S: ClientStream>(
                                 parts.push(format!("{nick}=+~{username}@matrix2078"));
                             }
                         }
-                        framed.send(num(server, Response::RPL_USERHOST, nick, vec![parts.join(" ")])).await?;
+                        tx.send(num(server, Response::RPL_USERHOST, nick, vec![parts.join(" ")])).await?;
                     }
                     Command::QUIT(reason) => {
-                        send_quit(framed, server, reason).await?;
+                        let why = reason.unwrap_or_else(|| "Client Quit".to_owned());
+                        let _ = prio_tx
+                            .send(srv(server, Command::ERROR(format!("Closing Link: ({why})"))))
+                            .await;
                         return Ok(());
                     }
                     Command::ERROR(text) => {
@@ -1022,7 +1091,7 @@ async fn relay_loop<S: ClientStream>(
                         // fetch history off the read loop: federated /messages
                         // can take tens of seconds and must not stall PINGs
                         let bridge2 = Arc::clone(bridge);
-                        let tx = echo_tx.clone();
+                        let tx = tx.clone();
                         let server2 = server.to_owned();
                         let nick2 = nick.to_owned();
                         let caps2 = caps.clone();
@@ -1042,7 +1111,7 @@ async fn relay_loop<S: ClientStream>(
                             .next()
                             .unwrap_or("UNKNOWN")
                             .to_uppercase();
-                        framed.send(num(server, Response::ERR_UNKNOWNCOMMAND, nick, vec![
+                        tx.send(num(server, Response::ERR_UNKNOWNCOMMAND, nick, vec![
                             name,
                             "Unknown command".to_owned(),
                         ])).await?;
@@ -1055,8 +1124,7 @@ async fn relay_loop<S: ClientStream>(
 
 /// BATCH handling for incoming `draft/multiline` from the client.
 #[allow(clippy::too_many_arguments)]
-async fn handle_batch<S: ClientStream>(
-    framed: &mut Frame<S>,
+async fn handle_batch(
     _server: &str,
     nick: &str,
     prefix: &Prefix,
@@ -1069,7 +1137,6 @@ async fn handle_batch<S: ClientStream>(
     args: Option<Vec<String>>,
     reply_on_open: Option<String>,
 ) -> Result<()> {
-    let _ = framed;
     // close (-ref) carries no subcommand: it must be handled before
     // unpacking `sub`, or batches never flush
     if let Some(reference) = ref_name.strip_prefix('-') {
@@ -1648,8 +1715,8 @@ fn who_messages(
 
 /// Dispatch a control command sent to the `&matrix` pseudo-client and reply
 /// with NOTICEs. `accept`/`decline` manage pending room invitations.
-async fn control_command<S: ClientStream>(
-    framed: &mut Frame<S>,
+async fn control_command(
+    tx: &mpsc::Sender<Message>,
     caps: &Caps,
     server: &str,
     nick: &str,
@@ -1670,12 +1737,15 @@ async fn control_command<S: ClientStream>(
                     crate::matrix::verification::CONTROL_NICK,
                     Command::NOTICE(nick.to_owned(), reply),
                 );
-                send_out(framed, caps, m).await?;
+                let _ = tx.send(tags_for_client(caps, m)).await;
             }
             // newly joined channel: emit the JOIN burst right away
             if let Some(entry) = entry {
                 if entry.query.is_none() {
-                    send_join(framed, server, prefix, nick, &entry, bridge, bridge.cfg.bridge.names_limit).await?;
+                    let members = bridge.channel_members(&entry.channel).await.unwrap_or_default();
+                    for m in join_burst_messages(server, prefix, nick, &entry, members, bridge.cfg.bridge.names_limit) {
+                        let _ = tx.send(m).await;
+                    }
                 }
             }
         }
@@ -1685,11 +1755,10 @@ async fn control_command<S: ClientStream>(
                     crate::matrix::verification::CONTROL_NICK,
                     Command::NOTICE(nick.to_owned(), reply),
                 );
-                send_out(framed, caps, m).await?;
+                let _ = tx.send(tags_for_client(caps, m)).await;
             }
         }
     }
-    let _ = server;
     Ok(())
 }
 
