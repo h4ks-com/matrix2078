@@ -367,8 +367,31 @@ async fn main() -> Result<()> {
             let resp = room.send(content).await?;
             out(&format!("SENT {}", resp.response.event_id));
         }
+        "dm" => {
+            // dm <mxid> <text...>: reuse the existing DM room or create one
+            let mxid = args.get(2).context("dm <mxid> <text>")?.clone();
+            let text = args.get(3..).context("dm <mxid> <text>")?.join(" ");
+            let uid = UserId::parse(&mxid).context("bad mxid")?;
+            let room = match client.get_dm_room(&uid) {
+                Some(r) => r,
+                None => client.create_dm(&uid).await.context("creating DM")?,
+            };
+            let resp = room.send(RoomMessageEventContent::text_plain(text)).await?;
+            out(&format!("SENT {} {}", resp.response.event_id, room.room_id()));
+        }
+        "mkinvite" => {
+            // mkinvite <name> <mxid>: create a room named <name> and invite mxid
+            let name = args.get(2).context("mkinvite <name> <mxid>")?.clone();
+            let target = UserId::parse(args.get(3).context("mkinvite <name> <mxid>")?)
+                .context("bad mxid")?;
+            let mut req = matrix_sdk::ruma::api::client::room::create_room::v3::Request::new();
+            req.name = Some(name.clone());
+            req.invite = vec![target];
+            let room = client.create_room(req).await.context("creating room")?;
+            out(&format!("CREATED {} {}", room.room_id(), name));
+        }
         "whoami" => out(&format!("{}", client.user_id().context("no uid")?)),
-        other => bail!("unknown command {other:?}: send|send-image|verify|request|whoami"),
+        other => bail!("unknown command {other:?}: send|send-image|verify|request|dm|mkinvite|whoami"),
     }
     Ok(())
 }

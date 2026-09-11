@@ -28,6 +28,18 @@ pub struct Config {
     pub allow_register: bool,
     /// Room↔channel relay tuning.
     pub bridge: BridgeConfig,
+    /// Optional TLS for the IRC listener (PEM cert + key), for
+    /// non-loopback hosting.
+    pub tls: Option<TlsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// Path to the PEM certificate chain.
+    pub cert: PathBuf,
+    /// Path to the PEM private key.
+    pub key: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,6 +61,7 @@ impl Default for Config {
             homeserver: None,
             allow_register: false,
             bridge: BridgeConfig::default(),
+            tls: None,
         }
     }
 }
@@ -104,6 +117,14 @@ impl Config {
         if let Some(v) = env_parse::<usize>("MATRIX2078_NAMES_LIMIT") {
             self.bridge.names_limit = v;
         }
+        // both cert and key must be present for TLS
+        match (env_str("MATRIX2078_TLS_CERT"), env_str("MATRIX2078_TLS_KEY")) {
+            (Some(cert), Some(key)) => {
+                self.tls = Some(TlsConfig { cert: PathBuf::from(cert), key: PathBuf::from(key) });
+            }
+            (None, None) => {}
+            _ => eprintln!("warning: MATRIX2078_TLS_CERT and MATRIX2078_TLS_KEY must be set together; ignoring"),
+        }
     }
 }
 
@@ -151,6 +172,21 @@ mod tests {
         assert_eq!(cfg.listen.to_string(), "127.0.0.1:6667");
         assert_eq!(cfg.homeserver.as_deref(), Some("https://example.org"));
         assert_eq!(cfg.bridge.names_limit, 50);
+    }
+
+    #[test]
+    fn parse_tls() {
+        let cfg: Config = toml::from_str(
+            r##"
+            [tls]
+            cert = "certs/fullchain.pem"
+            key = "certs/privkey.pem"
+            "##,
+        )
+        .unwrap();
+        let tls = cfg.tls.expect("tls present");
+        assert_eq!(tls.cert, PathBuf::from("certs/fullchain.pem"));
+        assert_eq!(tls.key, PathBuf::from("certs/privkey.pem"));
     }
 
     #[test]

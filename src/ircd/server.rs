@@ -11,7 +11,7 @@ use std::{
     },
 };
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use futures::{SinkExt, StreamExt};
 use irc::proto::{CapSubCommand, Command, IrcCodec, Message, Prefix, Response};
 use irc::proto::message::Tag;
@@ -29,9 +29,50 @@ use crate::{
     media::MediaServer,
 };
 
+/// Any accepted client stream: plain TCP or TLS.
+pub trait ClientStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
+    fn set_nodelay(&self);
+}
+
+impl ClientStream for TcpStream {
+    fn set_nodelay(&self) {
+        TcpStream::set_nodelay(self, true).ok();
+    }
+}
+
+impl ClientStream for tokio_rustls::server::TlsStream<TcpStream> {
+    fn set_nodelay(&self) {
+        let _ = self.get_ref().0.set_nodelay(true);
+    }
+}
+
+/// A framed client connection regardless of transport.
+type Frame<S> = Framed<S, IrcCodec>;
+
 pub async fn run(cfg: Arc<Config>) -> Result<()> {
+    // ring-backed crypto provider for rustls (ignored if already installed)
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+
+    let tls_acceptor = match &cfg.tls {
+        Some(tls) => {
+            let certs = load_certs(&tls.cert)?;
+            let key = load_key(&tls.key)?;
+            let config = tokio_rustls::rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .context("building TLS config")?;
+            Some(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
+        }
+        None => None,
+    };
+
     let listener = TcpListener::bind(cfg.listen).await?;
-    tracing::info!(listen = %cfg.listen, server = %cfg.server_name, "ircd listening");
+    tracing::info!(
+        listen = %cfg.listen,
+        tls = cfg.tls.is_some(),
+        server = %cfg.server_name,
+        "ircd listening"
+    );
     let media = Arc::new(MediaServer::new(
         cfg.media_listen,
         crate::matrix::media::cache_dir(&cfg.state_dir),
@@ -46,26 +87,53 @@ pub async fn run(cfg: Arc<Config>) -> Result<()> {
     }
     loop {
         let (stream, peer) = listener.accept().await?;
-        tracing::info!(%peer, "client connected");
+        tracing::info!(%peer, tls = tls_acceptor.is_some(), "client connected");
         let cfg = cfg.clone();
         let media = Arc::clone(&media);
+        let acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, peer, cfg, media).await {
-                tracing::info!(%peer, error = %e, "connection closed with error");
-            } else {
-                tracing::info!(%peer, "connection closed");
+            let res = match acceptor {
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(tls_stream) => handle_conn(tls_stream, peer, cfg, media).await,
+                    Err(e) => Err(anyhow::anyhow!("TLS handshake: {e}")),
+                },
+                None => handle_conn(stream, peer, cfg, media).await,
+            };
+            match res {
+                Ok(()) => tracing::info!(%peer, "connection closed"),
+                Err(e) => tracing::info!(%peer, error = %e, "connection closed with error"),
             }
         });
     }
 }
 
-async fn handle_conn(
-    stream: TcpStream,
+fn load_certs(path: &std::path::Path) -> Result<Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening cert {}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("parsing certs {}", path.display()))?;
+    if certs.is_empty() {
+        anyhow::bail!("no certificates found in {}", path.display());
+    }
+    Ok(certs)
+}
+
+fn load_key(path: &std::path::Path) -> Result<tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening key {}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    rustls_pemfile::private_key(&mut reader)
+        .with_context(|| format!("parsing key {}", path.display()))?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", path.display()))
+}
+
+async fn handle_conn<S: ClientStream>(
+    stream: S,
     peer: SocketAddr,
     cfg: Arc<Config>,
     media: Arc<MediaServer>,
 ) -> Result<()> {
-    stream.set_nodelay(true).ok();
+    stream.set_nodelay();
     let codec = IrcCodec::new("UTF-8")?;
     let mut framed = Framed::new(stream, codec);
     let server = cfg.server_name.clone();
@@ -129,7 +197,11 @@ async fn handle_conn(
     }
 
     // JOIN every mapped room's channel before any PRIVMSG can reference it
+    // (DM/query mappings surface as private messages, not channels)
     for entry in bridge.entries() {
+        if entry.query.is_some() {
+            continue;
+        }
         bridge.joined.lock().expect("joined mutex").insert(entry.channel.to_ascii_lowercase());
         send_join(&mut framed, &server, &prefix, &nick, &entry, &bridge, cfg.bridge.names_limit)
             .await?;
@@ -149,8 +221,9 @@ async fn handle_conn(
 }
 
 /// CAP negotiation during registration.
-async fn handle_cap(
-    framed: &mut Framed<TcpStream, IrcCodec>,
+#[allow(clippy::too_many_arguments)]
+async fn handle_cap<S: ClientStream>(
+    framed: &mut Frame<S>,
     server: &str,
     reg: &mut Registration,
     sub: CapSubCommand,
@@ -192,8 +265,8 @@ async fn handle_cap(
 }
 
 /// SASL PLAIN during registration: `AUTHENTICATE PLAIN` then the base64 payload.
-async fn handle_authenticate(
-    framed: &mut Framed<TcpStream, IrcCodec>,
+async fn handle_authenticate<S: ClientStream>(
+    framed: &mut Frame<S>,
     server: &str,
     reg: &mut Registration,
     arg: &str,
@@ -261,19 +334,16 @@ async fn handle_authenticate(
     Ok(())
 }
 
-/// Parse a homeserver URL out of the GECOS (realname) field, matrix2051-style:
-/// accepts `https://host`, `http://host` or a bare `host`.
+/// Parse a homeserver hint out of the GECOS (realname) field, matrix2051-style:
+/// accepts `https://host`, `http://host` or a bare `host` (the bare form goes
+/// through full spec discovery: well-known → `_matrix._tcp` SRV → https).
 fn gecos_homeserver(realname: Option<&str>) -> Option<String> {
     let raw = realname?.trim();
     let has_scheme = raw.starts_with("https://") || raw.starts_with("http://");
     if raw.is_empty() || raw.contains(char::is_whitespace) || (!has_scheme && !raw.contains('.')) {
         return None;
     }
-    if has_scheme {
-        Some(raw.trim_end_matches('/').to_owned())
-    } else {
-        Some(format!("https://{}", raw.trim_end_matches('/')))
-    }
+    Some(raw.trim_end_matches('/').to_owned())
 }
 
 /// Sanitize the USER field into a sane IRC username: if it is a full mxid,
@@ -313,7 +383,7 @@ mod tests {
         );
         assert_eq!(
             gecos_homeserver(Some("matrix.doesnmlab.xyz/")).as_deref(),
-            Some("https://matrix.doesnmlab.xyz")
+            Some("matrix.doesnmlab.xyz")
         );
         assert_eq!(gecos_homeserver(Some("http://localhost:8008")).as_deref(), Some("http://localhost:8008"));
         assert_eq!(gecos_homeserver(Some("just a guy")), None);
@@ -353,12 +423,150 @@ mod tests {
         assert!(parse_chathistory(&["LATEST".into(), "#c".into(), "*".into(), "10".into()]).is_some());
         assert!(parse_chathistory(&["WAT".into()]).is_none());
     }
+
+    /// Full TLS listener test: self-signed cert (rcgen), IRCd behind
+    /// tokio-rustls, client with an accept-any verifier, PASS/NICK/USER
+    /// registration over the TLS stream.
+    #[tokio::test]
+    async fn tls_registration_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+        // pick free ports
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = probe.local_addr().unwrap();
+        drop(probe);
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let media_listen = probe.local_addr().unwrap();
+        drop(probe);
+
+        let cfg = Arc::new(Config {
+            listen,
+            media_listen,
+            state_dir: dir.path().join("state"),
+            tls: Some(crate::config::TlsConfig { cert: cert_path, key: key_path }),
+            ..Config::default()
+        });
+        tokio::spawn(async move {
+            if let Err(e) = run(cfg).await {
+                panic!("server run failed: {e}");
+            }
+        });
+        // wait for the listener to come up
+        for _ in 0..100 {
+            if std::net::TcpStream::connect_timeout(&listen, std::time::Duration::from_millis(100)).is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // client that accepts any certificate
+        #[derive(Debug)]
+        struct NoVerify;
+        impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+                _intermediates: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
+                _server_name: &tokio_rustls::rustls::pki_types::ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: tokio_rustls::rustls::pki_types::UnixTime,
+            ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error> {
+                Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+                _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+            ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+                Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+                _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+            ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+                Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+                vec![
+                    tokio_rustls::rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                    tokio_rustls::rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                    tokio_rustls::rustls::SignatureScheme::ED25519,
+                    tokio_rustls::rustls::SignatureScheme::RSA_PSS_SHA256,
+                ]
+            }
+        }
+        let mut tls_config = tokio_rustls::rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+            .with_no_client_auth();
+        tls_config.alpn_protocols = Vec::new();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
+
+        let tcp = tokio::net::TcpStream::connect(listen).await.unwrap();
+        let tls_stream = connector
+            .connect(tokio_rustls::rustls::pki_types::ServerName::try_from("localhost".to_owned()).unwrap(), tcp)
+            .await
+            .expect("TLS handshake");
+        let mut framed = Framed::new(tls_stream, IrcCodec::new("UTF-8").unwrap());
+        use futures::SinkExt;
+        framed
+            .send(Message {
+                tags: None,
+                prefix: None,
+                command: Command::PASS("secret".to_owned()),
+            })
+            .await
+            .unwrap();
+        framed
+            .send(Message {
+                tags: None,
+                prefix: None,
+                command: Command::NICK("tester".to_owned()),
+            })
+            .await
+            .unwrap();
+        framed
+            .send(Message {
+                tags: None,
+                prefix: None,
+                command: Command::USER("t".to_owned(), "0".to_owned(), "x".to_owned()),
+            })
+            .await
+            .unwrap();
+        // registration will fail with ERR_PASSWDMISMATCH (no matrix behind
+        // it), but any numeric reply proves the TLS IRC path works
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut saw_numeric = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), framed.next()).await {
+                Ok(Some(Ok(m))) => {
+                    if matches!(m.command, Command::Response(..)) {
+                        saw_numeric = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(saw_numeric, "expected a numeric reply over TLS");
+    }
 }
 
 /// Send a message to the client, filtering message tags to what was
 /// negotiated and stamping server-time on untagged traffic when enabled.
-async fn send_out(
-    framed: &mut Framed<TcpStream, IrcCodec>,
+async fn send_out<S: ClientStream>(
+    framed: &mut Frame<S>,
     caps: &Caps,
     m: Message,
 ) -> Result<()> {
@@ -406,8 +614,8 @@ fn tag_value(msg: &Message, name: &str) -> Option<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn relay_loop(
-    framed: &mut Framed<TcpStream, IrcCodec>,
+async fn relay_loop<S: ClientStream>(
+    framed: &mut Frame<S>,
     peer: &SocketAddr,
     server: &str,
     prefix: &Prefix,
@@ -476,16 +684,22 @@ async fn relay_loop(
                     Command::PONG(..) => {}
                     Command::PRIVMSG(target, body) => {
                         if target.eq_ignore_ascii_case(crate::matrix::verification::CONTROL_NICK) {
-                            control_command(framed, caps, server, nick, bridge, &body).await?;
-                        } else {
+                            control_command(framed, caps, server, nick, &prefix, bridge, &body).await?;
+                        } else if target.starts_with('&') {
+                            // other service-ish targets: ignore
+                        } else if target.starts_with('#') {
                             relay_from_irc(bridge, nick, &prefix, &target, body, false, known_channel(&target), is_joined(&target), caps, &echo_tx, reply_tag).await?;
+                        } else {
+                            relay_query_from_irc(bridge, nick, &prefix, &target, body, false, caps, &echo_tx, reply_tag).await?;
                         }
                     }
                     Command::NOTICE(target, body) => {
                         if target.eq_ignore_ascii_case(crate::matrix::verification::CONTROL_NICK) {
-                            control_command(framed, caps, server, nick, bridge, &body).await?;
-                        } else {
+                            control_command(framed, caps, server, nick, &prefix, bridge, &body).await?;
+                        } else if target.starts_with('&') || target.starts_with('#') {
                             relay_from_irc(bridge, nick, &prefix, &target, body, true, known_channel(&target), is_joined(&target), caps, &echo_tx, reply_tag).await?;
+                        } else {
+                            relay_query_from_irc(bridge, nick, &prefix, &target, body, true, caps, &echo_tx, reply_tag).await?;
                         }
                     }
                     Command::Raw(ref cmd, ref params) if cmd == "TAGMSG" => {
@@ -678,7 +892,25 @@ async fn relay_loop(
                         }
                     }
                     Command::ISON(list) => {
-                        let found: Vec<String> = list.iter().filter(|n| n.eq_ignore_ascii_case(nick)).cloned().collect();
+                        // ourselves + DM query partners are "online"
+                        let partners: Vec<String> = bridge
+                            .rooms
+                            .lock()
+                            .expect("rooms mutex")
+                            .entries()
+                            .iter()
+                            .filter_map(|e| e.query.clone())
+                            .collect();
+                        let found: Vec<String> = list
+                            .iter()
+                            .filter(|n| {
+                                n.eq_ignore_ascii_case(nick)
+                                    || partners
+                                        .iter()
+                                        .any(|p| p.eq_ignore_ascii_case(n))
+                            })
+                            .cloned()
+                            .collect();
                         framed.send(num(server, Response::RPL_ISON, nick, vec![found.join(" ")])).await?;
                     }
                     Command::USERHOST(list) => {
@@ -721,8 +953,8 @@ async fn relay_loop(
 
 /// BATCH handling for incoming `draft/multiline` from the client.
 #[allow(clippy::too_many_arguments)]
-async fn handle_batch(
-    framed: &mut Framed<TcpStream, IrcCodec>,
+async fn handle_batch<S: ClientStream>(
+    framed: &mut Frame<S>,
     _server: &str,
     nick: &str,
     prefix: &Prefix,
@@ -840,8 +1072,8 @@ fn fail_chathistory(server: &str, _nick: &str, code: &str, target: &str, ctx: &s
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_chathistory(
-    framed: &mut Framed<TcpStream, IrcCodec>,
+async fn handle_chathistory<S: ClientStream>(
+    framed: &mut Frame<S>,
     server: &str,
     nick: &str,
     bridge: &Arc<Bridge>,
@@ -859,11 +1091,20 @@ async fn handle_chathistory(
         }
     };
 
-    // resolve target -> room
+    // resolve target -> room (channel or DM query nick)
     let target_of = |t: &str| -> Option<(String, matrix_sdk::Room)> {
-        let entry = bridge.rooms.lock().expect("rooms mutex").get_by_channel(t).cloned()?;
-        let room = bridge.client.get_room(&entry.room_id)?;
-        Some((entry.channel.clone(), room))
+        let maps = bridge.rooms.lock().expect("rooms mutex");
+        if let Some(entry) = maps.get_by_channel(t).cloned() {
+            drop(maps);
+            let room = bridge.client.get_room(&entry.room_id)?;
+            Some((entry.channel.clone(), room))
+        } else if let Some(entry) = maps.get_by_query(t).cloned() {
+            drop(maps);
+            let room = bridge.client.get_room(&entry.room_id)?;
+            Some((entry.query.clone().unwrap_or_else(|| t.to_owned()), room))
+        } else {
+            None
+        }
     };
 
     let ref_id = format!("ch{}", counter.fetch_add(1, Ordering::Relaxed));
@@ -965,8 +1206,8 @@ async fn handle_chathistory(
     Ok(())
 }
 
-async fn send_history(
-    framed: &mut Framed<TcpStream, IrcCodec>,
+async fn send_history<S: ClientStream>(
+    framed: &mut Frame<S>,
     open: Message,
     close: Message,
     channel: &str,
@@ -981,8 +1222,8 @@ async fn send_history(
     Ok(())
 }
 
-async fn send_quit(
-    framed: &mut Framed<TcpStream, IrcCodec>,
+async fn send_quit<S: ClientStream>(
+    framed: &mut Frame<S>,
     server: &str,
     reason: Option<String>,
 ) -> Result<()> {
@@ -991,8 +1232,8 @@ async fn send_quit(
     Ok(())
 }
 
-async fn matrix_auth(
-    framed: &mut Framed<TcpStream, IrcCodec>,
+async fn matrix_auth<S: ClientStream>(
+    framed: &mut Frame<S>,
     cfg: &Arc<Config>,
     reg: &Registration,
     media: &Arc<crate::media::MediaServer>,
@@ -1125,8 +1366,8 @@ fn lusers(server: &str, nick: &str) -> Vec<Message> {
     ]
 }
 
-async fn send_join(
-    framed: &mut Framed<TcpStream, IrcCodec>,
+async fn send_join<S: ClientStream>(
+    framed: &mut Frame<S>,
     server: &str,
     prefix: &Prefix,
     nick: &str,
@@ -1147,8 +1388,8 @@ async fn send_join(
 
 /// Send 353/366 for a channel, capped and chunked to keep huge rooms
 /// from freezing IRC clients.
-async fn send_names(
-    framed: &mut Framed<TcpStream, IrcCodec>,
+async fn send_names<S: ClientStream>(
+    framed: &mut Frame<S>,
     server: &str,
     nick: &str,
     channel: &str,
@@ -1198,8 +1439,8 @@ async fn send_names(
     Ok(())
 }
 
-async fn send_who(
-    framed: &mut Framed<TcpStream, IrcCodec>,
+async fn send_who<S: ClientStream>(
+    framed: &mut Frame<S>,
     server: &str,
     nick: &str,
     channel: &str,
@@ -1226,24 +1467,89 @@ async fn send_who(
 }
 
 /// Dispatch a control command sent to the `&matrix` pseudo-client and reply
-/// with NOTICEs.
-async fn control_command(
-    framed: &mut Framed<TcpStream, IrcCodec>,
+/// with NOTICEs. `accept`/`decline` manage pending room invitations.
+async fn control_command<S: ClientStream>(
+    framed: &mut Frame<S>,
     caps: &Caps,
     server: &str,
     nick: &str,
+    prefix: &Prefix,
     bridge: &Arc<Bridge>,
     body: &str,
 ) -> Result<()> {
     tracing::debug!(nick, command = %body, "control command");
-    for reply in bridge.hub.command(body).await {
-        let m = proto::user(
-            crate::matrix::verification::CONTROL_NICK,
-            Command::NOTICE(nick.to_owned(), reply),
-        );
-        send_out(framed, caps, m).await?;
+    let first = body.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
+    match first.as_str() {
+        "accept" | "decline" | "invites" => {
+            let (replies, entry) = match bridge.invite_command(body).await {
+                Ok(r) => r,
+                Err(e) => (vec![format!("invite command failed: {e:#}")], None),
+            };
+            for reply in replies {
+                let m = proto::user(
+                    crate::matrix::verification::CONTROL_NICK,
+                    Command::NOTICE(nick.to_owned(), reply),
+                );
+                send_out(framed, caps, m).await?;
+            }
+            // newly joined channel: emit the JOIN burst right away
+            if let Some(entry) = entry {
+                if entry.query.is_none() {
+                    send_join(framed, server, prefix, nick, &entry, bridge, bridge.cfg.bridge.names_limit).await?;
+                }
+            }
+        }
+        _ => {
+            for reply in bridge.hub.command(body).await {
+                let m = proto::user(
+                    crate::matrix::verification::CONTROL_NICK,
+                    Command::NOTICE(nick.to_owned(), reply),
+                );
+                send_out(framed, caps, m).await?;
+            }
+        }
     }
     let _ = server;
+    Ok(())
+}
+
+/// IRC query PRIVMSG/NOTICE (target is a nick) → the DM room with that user.
+#[allow(clippy::too_many_arguments)]
+async fn relay_query_from_irc(
+    bridge: &Arc<Bridge>,
+    nick: &str,
+    prefix: &Prefix,
+    target: &str,
+    body: String,
+    notice: bool,
+    caps: &Caps,
+    echo_tx: &mpsc::Sender<Message>,
+    reply_to: Option<String>,
+) -> Result<()> {
+    // send in the background so a slow homeserver can't stall IRC reads
+    let bridge = Arc::clone(bridge);
+    let target = target.to_owned();
+    let echo = caps.has("echo-message");
+    let caps = caps.clone();
+    let prefix = prefix.clone();
+    let nick = nick.to_owned();
+    let echo_tx = echo_tx.clone();
+    tokio::spawn(async move {
+        match bridge.send_query(&target, body.clone(), notice, reply_to.as_deref()).await {
+            Ok(event_id) => {
+                if echo {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    for m in crate::bridge::echo_messages(&caps, &prefix, &nick, &target, &body, &event_id, ts, notice, reply_to.as_deref()) {
+                        let _ = echo_tx.send(m).await;
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(query = %target, error = %e, "matrix dm send failed"),
+        }
+    });
     Ok(())
 }
 

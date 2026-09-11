@@ -59,6 +59,16 @@ rendered as `* new body`) and **redactions** (`draft/message-redaction`
 nicks). See `AGENTS.md` for the milestone plan up to M6 (goguma/voidbar
 compat passes).
 
+M5 adds people, not rooms: **DMs map to IRC queries** (2-party direct
+chats surface as private messages from the other party's nick — both ways,
+with the DM created on first contact if needed), **room invitations** are
+prompted over IRC (`/msg &matrix accept|decline <n>`, with offline invites
+surfacing on connect; accepted channel rooms get their JOIN burst
+immediately), **homeserver discovery** (a bare domain in config/GECOS goes
+through well-known → `_matrix._tcp` SRV → `https://domain`), and an
+**optional TLS listener** for non-loopback hosting (`[tls] cert/key` in
+`matrix2078.toml`, self-signed-friendly).
+
 ## Usage
 
 ```

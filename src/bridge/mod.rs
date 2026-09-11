@@ -38,6 +38,17 @@ use crate::{
 pub mod history;
 pub mod rooms;
 
+/// A pending room invitation surfaced over IRC.
+#[derive(Debug, Clone)]
+pub struct PendingInvite {
+    pub idx: u64,
+    pub room_id: OwnedRoomId,
+    /// Best-effort room name (name, alias localpart or inviter's name).
+    pub name: String,
+    /// Inviter mxid.
+    pub sender: String,
+}
+
 /// Shared per-user bridge state visible to event handlers.
 pub struct Bridge {
     pub client: Client,
@@ -51,6 +62,11 @@ pub struct Bridge {
     pub caps: Caps,
     /// SAS verification flows driven through the `&matrix` pseudo-client.
     pub hub: Arc<VerificationHub>,
+    /// IRC nick of the owning connection (query messages are addressed to it).
+    pub irc_nick: String,
+    /// Pending invitations awaiting `/msg &matrix accept|decline`.
+    pub invites: Arc<Mutex<Vec<PendingInvite>>>,
+    next_invite_idx: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Bridge {
@@ -78,28 +94,61 @@ impl Bridge {
         let hub = VerificationHub::new(client.clone(), own_mxid.clone(), nick);
 
         let maps_path = channels_path(&cfg.state_dir, &crate::matrix::client::state_key(nick, login_user));
-        let mut maps = RoomMaps::load(maps_path);
+        let rooms = Arc::new(Mutex::new(RoomMaps::load(maps_path)));
         let live: HashSet<OwnedRoomId> =
             client.joined_rooms().iter().map(|r| r.room_id().to_owned()).collect();
-        maps.prune_to(&live);
+        rooms.lock().expect("rooms mutex").prune_to(&live);
         for room in client.joined_rooms() {
             if room.is_space() {
                 continue;
             }
-            let (base, topic) = Self::room_label(&room).await;
-            maps.ensure(room.room_id().to_owned(), &base, topic);
+            Self::ensure_room_mapping(&rooms, &room).await;
+        }
+
+        // invitations that arrived while we were offline
+        let mut invites = Vec::new();
+        let mut idx = 0u64;
+        for room in client.invited_rooms() {
+            idx += 1;
+            let mut inv = describe_invite(&room).await;
+            inv.idx = idx;
+            invites.push(inv);
         }
 
         Ok(Arc::new(Self {
             client: client.clone(),
             own_mxid,
-            rooms: Arc::new(Mutex::new(maps)),
+            rooms,
             joined: Arc::new(Mutex::new(HashSet::new())),
             cfg: cfg.clone(),
             media,
             caps,
             hub,
+            irc_nick: nick.to_owned(),
+            invites: Arc::new(Mutex::new(invites)),
+            next_invite_idx: Arc::new(std::sync::atomic::AtomicU64::new(idx + 1)),
         }))
+    }
+
+    /// Compute (or refresh) the mapping for a joined room: 2-party DMs map
+    /// to IRC queries, everything else to stable channels.
+    pub async fn ensure_room_mapping(maps: &Arc<Mutex<RoomMaps>>, room: &Room) -> RoomEntry {
+        if room.compute_is_dm().await.unwrap_or_else(|_| room.is_dm()) {
+            let other = room
+                .members(matrix_sdk::RoomMemberships::JOIN)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .find(|m| m.user_id() != room.client().user_id().expect("own id"))
+                .map(|m| proto::mxid_to_nick(m.user_id().as_str()))
+                .unwrap_or_else(|| "query".to_owned());
+            let mut maps = maps.lock().expect("rooms mutex");
+            maps.ensure_query(room.room_id().to_owned(), &other, String::new()).clone()
+        } else {
+            let (base, topic) = Self::room_label(room).await;
+            let mut maps = maps.lock().expect("rooms mutex");
+            maps.ensure(room.room_id().to_owned(), &base, topic).clone()
+        }
     }
 
     /// Preferred channel base (without `#`) and topic for a room.
@@ -160,7 +209,18 @@ impl Bridge {
         self.encrypted_handler(tx.clone());
         self.reaction_handler(tx.clone());
         self.redaction_handler(tx.clone());
-        self.presence_handler(tx);
+        self.presence_handler(tx.clone());
+        self.invite_handler(tx.clone());
+        // prompt for invitations collected during the initial sync
+        let invites = Arc::clone(&self.invites);
+        let irc_nick = self.irc_nick.clone();
+        let txp = tx.clone();
+        tokio::spawn(async move {
+            let pending = invites.lock().expect("invites mutex").clone();
+            for inv in pending {
+                let _ = txp.send(invite_prompt(&irc_nick, &inv)).await;
+            }
+        });
     }
 
     fn message_handler(&self, tx: mpsc::Sender<Message>) {
@@ -171,6 +231,7 @@ impl Bridge {
         let media = Arc::clone(&self.media);
         let caps = self.caps.clone();
         let hub = Arc::clone(&self.hub);
+        let irc_nick = self.irc_nick.clone();
         self.client.add_event_handler(
             move |ev: SyncRoomMessageEvent, room: Room, client: Client| {
                 let tx = tx.clone();
@@ -181,6 +242,7 @@ impl Bridge {
                 let media = Arc::clone(&media);
                 let caps = caps.clone();
                 let hub = Arc::clone(&hub);
+                let irc_nick = irc_nick.clone();
                 async move {
                     let matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(ev) = ev else {
                         return;
@@ -235,13 +297,15 @@ impl Bridge {
                     };
                     let entry = match entry {
                         Some(e) => e,
-                        None => {
-                            let (base, topic) = Bridge::room_label(&room).await;
-                            let mut maps = rooms.lock().expect("rooms mutex");
-                            maps.ensure(room.room_id().to_owned(), &base, topic).clone()
-                        }
+                        None => Bridge::ensure_room_mapping(&rooms, &room).await,
                     };
-                    let channel = entry.channel.clone();
+                    // DMs surface as queries: PRIVMSG from the other party
+                    // addressed to our own nick; no channel JOIN/TOPIC
+                    let target = if entry.query.is_some() {
+                        irc_nick.clone()
+                    } else {
+                        entry.channel.clone()
+                    };
 
                     let body = match render_body(msgtype, &client, &media, &cfg).await {
                         Some(b) => b,
@@ -270,9 +334,9 @@ impl Bridge {
                     let body = localize_mentions(&body, &room).await;
 
                     // JOIN must always be emitted before any PRIVMSG on a channel
-                    let need_join = {
+                    let need_join = entry.query.is_none() && {
                         let mut j = joined.lock().expect("joined mutex");
-                        let lower = channel.to_ascii_lowercase();
+                        let lower = target.to_ascii_lowercase();
                         if j.contains(&lower) {
                             false
                         } else {
@@ -283,14 +347,14 @@ impl Bridge {
                     let nick = proto::mxid_to_nick(sender.as_str());
                     if need_join {
                         let _ = tx
-                            .send(proto::user(&nick, Command::JOIN(channel.clone(), None, None)))
+                            .send(proto::user(&nick, Command::JOIN(target.clone(), None, None)))
                             .await;
                         let _ = tx
                             .send(proto::srv(
                                 &cfg.server_name,
                                 Command::Response(
                                     irc::proto::Response::RPL_TOPIC,
-                                    vec!["*".into(), channel.clone(), entry.topic.clone()],
+                                    vec!["*".into(), target.clone(), entry.topic.clone()],
                                 ),
                             ))
                             .await;
@@ -302,7 +366,7 @@ impl Bridge {
                     let is_emote = matches!(msgtype, MessageType::Emote(_));
                     let sender_prefix = proto::user_prefix(&nick);
                     let msgs = body_to_irc(
-                        &caps, &sender_prefix, &channel, &body, &msgid, ts, is_notice, is_emote,
+                        &caps, &sender_prefix, &target, &body, &msgid, ts, is_notice, is_emote,
                         reply_to.as_deref(),
                     );
                     for m in msgs {
@@ -361,6 +425,7 @@ impl Bridge {
         let rooms = Arc::clone(&self.rooms);
         let joined = Arc::clone(&self.joined);
         let own = self.own_mxid.clone();
+        let irc_nick = self.irc_nick.clone();
         self.client.add_event_handler(
             move |ev: matrix_sdk::ruma::events::room::encrypted::SyncRoomEncryptedEvent,
                   room: Room| {
@@ -368,6 +433,7 @@ impl Bridge {
                 let rooms = Arc::clone(&rooms);
                 let joined = Arc::clone(&joined);
                 let own = own.clone();
+                let irc_nick = irc_nick.clone();
                 async move {
                     let matrix_sdk::ruma::events::SyncMessageLikeEvent::Original(ev) = ev else {
                         return;
@@ -381,8 +447,13 @@ impl Bridge {
                     }) else {
                         return;
                     };
-                    let channel = entry.channel.clone();
-                    let need_join = {
+                    let is_query = entry.query.is_some();
+                    let channel = if is_query {
+                        irc_nick.clone()
+                    } else {
+                        entry.channel.clone()
+                    };
+                    let need_join = !is_query && {
                         let mut j = joined.lock().expect("joined mutex");
                         let lower = channel.to_ascii_lowercase();
                         if j.contains(&lower) {
@@ -620,6 +691,65 @@ impl Bridge {
         let Some(room) = self.client.get_room(&room_id) else {
             anyhow::bail!("lost room {}", room_id.as_str());
         };
+        Self::send_room_message(&room, body, notice, reply_to).await
+    }
+
+    /// Deliver an IRC query PRIVMSG/NOTICE to the DM room with `nick`,
+    /// creating the DM if this is the first contact.
+    pub async fn send_query(
+        &self,
+        nick: &str,
+        body: String,
+        notice: bool,
+        reply_to: Option<&str>,
+    ) -> Result<String> {
+        // an already-mapped DM room wins
+        let mapped = {
+            let maps = self.rooms.lock().expect("rooms mutex");
+            maps.get_by_query(nick).map(|e| e.room_id.clone())
+        };
+        let room = match mapped.and_then(|rid| self.client.get_room(&rid)) {
+            Some(r) if r.state() == RoomState::Joined => r,
+            _ => {
+                let uid = self
+                    .resolve_nick(nick)
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("no Matrix user known as nick {nick}"))?;
+                match self.client.get_dm_room(&uid) {
+                    Some(r) if r.state() == RoomState::Joined => r,
+                    _ => self.client.create_dm(&uid).await.context("creating DM room")?,
+                }
+            }
+        };
+        // keep the mapping fresh (covers newly created DMs)
+        Self::ensure_room_mapping(&self.rooms, &room).await;
+        Self::send_room_message(&room, body, notice, reply_to).await
+    }
+
+    /// Resolve an IRC nick to a Matrix user id by scanning the members of
+    /// every joined room.
+    async fn resolve_nick(&self, nick: &str) -> Option<matrix_sdk::ruma::OwnedUserId> {
+        for room in self.client.joined_rooms() {
+            let members = room
+                .members(matrix_sdk::RoomMemberships::JOIN)
+                .await
+                .unwrap_or_default();
+            for m in members {
+                if proto::mxid_to_nick(m.user_id().as_str()).eq_ignore_ascii_case(nick) {
+                    return Some(m.user_id().to_owned());
+                }
+            }
+        }
+        None
+    }
+
+    /// Shared send path: IRC→Matrix conversion, reply relation, mentions.
+    async fn send_room_message(
+        room: &Room,
+        body: String,
+        notice: bool,
+        reply_to: Option<&str>,
+    ) -> Result<String> {
         // IRC → Matrix formatting (mIRC codes, links, mxid links)
         let member_mxids: Vec<String> = room
             .members(matrix_sdk::RoomMemberships::JOIN)
@@ -645,7 +775,7 @@ impl Bridge {
             }
         }
         // mentions: IRC nicks present as words map back to Matrix user ids
-        let mentioned = mentioned_mxids(&body, &room, &member_mxids).await;
+        let mentioned = mentioned_mxids(&body, room, &member_mxids).await;
         if !mentioned.is_empty() {
             let mut m = matrix_sdk::ruma::events::Mentions::new();
             m.user_ids = mentioned
@@ -660,6 +790,139 @@ impl Bridge {
             .context("sending message to matrix room")?;
         Ok(resp.response.event_id.to_string())
     }
+
+    /// Live invitations while connected: prompt over IRC from `&matrix`.
+    /// Invited rooms surface as *stripped* member events.
+    fn invite_handler(&self, tx: mpsc::Sender<Message>) {
+        use matrix_sdk::ruma::events::room::member::{MembershipState, StrippedRoomMemberEvent};
+        let invites = Arc::clone(&self.invites);
+        let counter = Arc::clone(&self.next_invite_idx);
+        let own = self.own_mxid.clone();
+        let irc_nick = self.irc_nick.clone();
+        self.client.add_event_handler(
+            move |ev: StrippedRoomMemberEvent, room: Room| {
+                let tx = tx.clone();
+                let invites = Arc::clone(&invites);
+                let counter = Arc::clone(&counter);
+                let own = own.clone();
+                let irc_nick = irc_nick.clone();
+                async move {
+                    // our own invite membership, in a room we are not in yet
+                    if ev.state_key != *own
+                        || ev.content.membership != MembershipState::Invite
+                        || room.state() != RoomState::Invited
+                    {
+                        return;
+                    }
+                    let room_id = room.room_id().to_owned();
+                    // several stripped events fire per invite; dedupe
+                    if invites
+                        .lock()
+                        .expect("invites mutex")
+                        .iter()
+                        .any(|i| i.room_id == room_id)
+                    {
+                        return;
+                    }
+                    let mut inv = describe_invite(&room).await;
+                    inv.sender = ev.sender.to_string();
+                    inv.idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let _ = tx.send(invite_prompt(&irc_nick, &inv)).await;
+                    invites.lock().expect("invites mutex").push(inv);
+                }
+            },
+        );
+    }
+
+    /// Handle `/msg &matrix accept|decline|invites …`. On a successful accept
+    /// of a channel room the new mapping is returned so the caller can emit
+    /// the JOIN burst.
+    pub async fn invite_command(
+        &self,
+        rest: &str,
+    ) -> Result<(Vec<String>, Option<RoomEntry>)> {
+        let mut words = rest.split_whitespace();
+        let cmd = words.next().unwrap_or_default().to_ascii_lowercase();
+        let arg = words.next().map(str::to_owned);
+        let find = |arg: &str| -> Option<PendingInvite> {
+            let invites = self.invites.lock().expect("invites mutex");
+            invites
+                .iter()
+                .find(|i| {
+                    i.idx.to_string() == arg
+                        || i.room_id.as_str().eq_ignore_ascii_case(arg)
+                })
+                .cloned()
+        };
+        match (cmd.as_str(), arg) {
+            ("invites", _) => {
+                let invites = self.invites.lock().expect("invites mutex").clone();
+                let mut out = Vec::new();
+                if invites.is_empty() {
+                    out.push("no pending invitations".to_owned());
+                }
+                for i in invites {
+                    out.push(format!(
+                        "#{}: {} from {} — accept {} | decline {}",
+                        i.idx, i.name, proto::mxid_to_nick(&i.sender), i.idx, i.idx
+                    ));
+                }
+                Ok((out, None))
+            }
+            ("accept", Some(arg)) => {
+                let Some(inv) = find(&arg) else {
+                    return Ok((vec![format!("no pending invite matching {arg}")], None));
+                };
+                self.invites
+                    .lock()
+                    .expect("invites mutex")
+                    .retain(|i| i.room_id != inv.room_id);
+                let Some(room) = self.client.get_room(&inv.room_id) else {
+                    return Ok((vec!["lost the invited room".to_owned()], None));
+                };
+                room.join().await.context("joining invited room")?;
+                // direct invitations become DM queries: mirror the flag into
+                // our m.direct account data so compute_is_dm() agrees
+                if invite_was_direct(&room).await {
+                    let _ = room.set_is_direct(true).await;
+                }
+                let entry = Self::ensure_room_mapping(&self.rooms, &room).await;
+                if entry.query.is_none() {
+                    self.joined
+                        .lock()
+                        .expect("joined mutex")
+                        .insert(entry.channel.to_ascii_lowercase());
+                    Ok((
+                        vec![format!("joined {}", entry.channel)],
+                        Some(entry),
+                    ))
+                } else {
+                    Ok((
+                        vec![format!("joined DM with {}", entry.query.clone().unwrap_or_default())],
+                        None,
+                    ))
+                }
+            }
+            ("decline", Some(arg)) => {
+                let Some(inv) = find(&arg) else {
+                    return Ok((vec![format!("no pending invite matching {arg}")], None));
+                };
+                self.invites
+                    .lock()
+                    .expect("invites mutex")
+                    .retain(|i| i.room_id != inv.room_id);
+                if let Some(room) = self.client.get_room(&inv.room_id) {
+                    room.leave().await.context("declining invitation")?;
+                }
+                Ok((vec![format!("declined {}", inv.name)], None))
+            }
+            _ => Ok((
+                vec!["usage: accept <n|room-id> | decline <n|room-id> | invites".to_owned()],
+                None,
+            )),
+        }
+    }
+
 
     /// Send a reaction (`+draft/react` TAGMSG) as an m.reaction annotation.
     pub async fn send_reaction(&self, channel: &str, target: &str, key: &str) -> Result<()> {
@@ -870,6 +1133,69 @@ fn chunks(s: &str, width: usize) -> Vec<&str> {
         start = end;
     }
     out
+}
+
+/// Best-effort description of an invited room for the IRC prompt.
+async fn describe_invite(room: &Room) -> PendingInvite {
+    let name = room
+        .name()
+        .filter(|n| !n.is_empty())
+        .or_else(|| {
+            room.canonical_alias()
+                .map(|a| a.alias().trim_start_matches('#').to_owned())
+        })
+        .or_else(|| {
+            room.alt_aliases()
+                .last()
+                .map(|a| a.alias().trim_start_matches('#').to_owned())
+        })
+        .unwrap_or_else(|| "unnamed room".to_owned());
+    let sender = room
+        .invite_details()
+        .await
+        .map(|d| d.inviter_id.to_string())
+        .unwrap_or_default();
+    PendingInvite { idx: 0, room_id: room.room_id().to_owned(), name, sender }
+}
+
+/// Was this invited room created as a direct chat? Reads the `is_direct`
+/// flag off our own (stripped) member event.
+async fn invite_was_direct(room: &Room) -> bool {
+    let Some(own) = room.client().user_id().map(|u| u.to_owned()) else {
+        return false;
+    };
+    let Some(member) = room.get_member(&own).await.ok().flatten() else {
+        return false;
+    };
+    use matrix_sdk::deserialized_responses::SyncOrStrippedState;
+    match member.event().as_ref() {
+        SyncOrStrippedState::Sync(e) => e
+            .as_original()
+            .map(|o| o.content.is_direct)
+            .unwrap_or_default()
+            .unwrap_or(false),
+        SyncOrStrippedState::Stripped(e) => e.content.is_direct.unwrap_or(false),
+    }
+}
+
+/// The IRC prompt line for a pending invitation.
+fn invite_prompt(irc_nick: &str, inv: &PendingInvite) -> Message {
+    proto::user(
+        crate::matrix::verification::CONTROL_NICK,
+        Command::NOTICE(
+            irc_nick.to_owned(),
+            format!(
+                "invite #{}: {} from {} — /msg {} accept {} | decline {} [{}]",
+                inv.idx,
+                inv.name,
+                proto::mxid_to_nick(&inv.sender),
+                crate::matrix::verification::CONTROL_NICK,
+                inv.idx,
+                inv.idx,
+                inv.room_id
+            ),
+        ),
+    )
 }
 
 async fn push_topic(

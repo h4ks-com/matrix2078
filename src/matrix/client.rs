@@ -30,9 +30,17 @@ pub fn user_dir(state_dir: &Path, nick: &str) -> PathBuf {
 async fn build_client(homeserver: &str, sqlite_dir: &Path) -> Result<Client> {
     fs::create_dir_all(sqlite_dir)
         .with_context(|| format!("creating state dir {}", sqlite_dir.display()))?;
-    Client::builder()
-        .homeserver_url(homeserver)
-        .sqlite_store(sqlite_dir, None)
+    let mut builder = Client::builder().sqlite_store(sqlite_dir, None);
+    if homeserver.contains("://") {
+        builder = builder.homeserver_url(homeserver);
+    } else {
+        // bare domain: full spec discovery (well-known, then _matrix._tcp
+        // SRV, then https://domain) — the pto/matrirc style, done by the SDK
+        let server_name = matrix_sdk::ruma::ServerName::parse(homeserver)
+            .with_context(|| format!("invalid server name {homeserver:?}"))?;
+        builder = builder.server_name(&server_name);
+    }
+    builder
         .build()
         .await
         .map_err(|e| anyhow::anyhow!("building matrix client for {homeserver}: {e}"))
@@ -113,9 +121,11 @@ pub async fn login_or_restore(
             .matrix_auth()
             .session()
             .ok_or_else(|| anyhow::anyhow!("no session after login"))?;
-        let ps = PersistedSession { homeserver: homeserver.clone(), session };
+        // persist the *resolved* homeserver so restores skip discovery
+        let resolved = client.homeserver().to_string();
+        let ps = PersistedSession { homeserver: resolved.clone(), session };
         save(&dir, irc_pass, &ps)?;
-        tracing::info!(nick, homeserver, user = %ps.session.meta.user_id, "logged in and stored new matrix session");
+        tracing::info!(nick, homeserver = %resolved, user = %ps.session.meta.user_id, "logged in and stored new matrix session");
         Ok(client)
     }
 }
