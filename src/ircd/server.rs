@@ -293,6 +293,7 @@ fn spawn_writer<S: ClientStream + 'static>(
                 maybe = prio_rx.recv() => {
                     match maybe {
                         Some(m) => {
+                            tracing::debug!(command = ?m.command, "prio out");
                             if sink.send(m).await.is_err() {
                                 break;
                             }
@@ -329,6 +330,7 @@ fn spawn_writer<S: ClientStream + 'static>(
                 maybe = rx.recv() => {
                     match maybe {
                         Some(m) => {
+                            tracing::trace!(command = ?m.command, "out");
                             if sink.send(tags_for_client(&caps, m)).await.is_err() {
                                 break;
                             }
@@ -1623,12 +1625,14 @@ pub fn join_burst_messages(
     names_limit: usize,
 ) -> Vec<Message> {
     let channel = entry.channel.clone();
+    // IRC forbids CR/LF inside a parameter: Matrix topics may contain them
+    let topic = entry.topic.replace(['\r', '\n'], " ");
     let mut out = vec![
         // JOIN is always emitted before any PRIVMSG on that channel
         from_client(prefix, Command::JOIN(channel.clone(), None, None)),
         num(server, Response::RPL_TOPIC, nick, vec![
             channel.clone(),
-            entry.topic.clone(),
+            topic,
         ]),
     ];
     out.extend(names_messages(server, nick, &channel, members, names_limit));

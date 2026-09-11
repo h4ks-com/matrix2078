@@ -1316,7 +1316,7 @@ async fn push_topic(
         }
     }
     let _ = tx
-        .send(proto::user("matrix", Command::TOPIC(entry.channel, Some(topic))))
+        .send(proto::user("matrix", Command::TOPIC(entry.channel, Some(topic.replace(['\r', '\n'], " ")))))
         .await;
 }
 
