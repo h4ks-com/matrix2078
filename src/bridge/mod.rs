@@ -70,8 +70,10 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    /// Log in / restore the Matrix session, do the initial sync and build
-    /// the room→channel mapping for every joined (non-space) room.
+    /// Log in / restore the Matrix session and load the stored room→channel
+    /// mapping. This is deliberately fast: the initial sync and the mapping of
+    /// newly seen rooms happen in [`Bridge::spawn_bootstrap`] so the IRC
+    /// registration burst is not delayed by a long initial sync.
     pub async fn connect(
         cfg: &Arc<Config>,
         nick: &str,
@@ -82,37 +84,14 @@ impl Bridge {
     ) -> Result<Arc<Self>> {
         let client = login_or_restore(cfg, nick, irc_pass, login_user).await?;
 
-        client
-            .sync_once(SyncSettings::default().ignore_timeout_on_first_sync(true))
-            .await
-            .context("initial matrix sync failed")?;
         let own_mxid = client
             .user_id()
             .map(|u| u.to_owned())
-            .ok_or_else(|| anyhow::anyhow!("client has no user id after sync"))?;
+            .ok_or_else(|| anyhow::anyhow!("client has no user id"))?;
         let hub = VerificationHub::new(client.clone(), own_mxid.clone(), nick);
 
         let maps_path = channels_path(&cfg.state_dir, &crate::matrix::client::state_key(login_user));
         let rooms = Arc::new(Mutex::new(RoomMaps::load(maps_path)));
-        let live: HashSet<OwnedRoomId> =
-            client.joined_rooms().iter().map(|r| r.room_id().to_owned()).collect();
-        rooms.lock().expect("rooms mutex").prune_to(&live);
-        for room in client.joined_rooms() {
-            if room.is_space() {
-                continue;
-            }
-            Self::ensure_room_mapping(&rooms, &room).await;
-        }
-
-        // invitations that arrived while we were offline
-        let mut invites = Vec::new();
-        let mut idx = 0u64;
-        for room in client.invited_rooms() {
-            idx += 1;
-            let mut inv = describe_invite(&room).await;
-            inv.idx = idx;
-            invites.push(inv);
-        }
 
         Ok(Arc::new(Self {
             client: client.clone(),
@@ -124,8 +103,8 @@ impl Bridge {
             caps,
             hub,
             irc_nick: nick.to_owned(),
-            invites: Arc::new(Mutex::new(invites)),
-            next_invite_idx: Arc::new(std::sync::atomic::AtomicU64::new(idx + 1)),
+            invites: Arc::new(Mutex::new(Vec::new())),
+            next_invite_idx: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }))
     }
 
@@ -317,8 +296,10 @@ impl Bridge {
                     } else {
                         body
                     };
-                    // strip the rich-reply fallback from plain bodies
-                    let body = if reply_to.is_some() && !is_edit {
+                    // strip the rich-reply fallback from plain bodies; clients
+                    // without message-tags cannot see +draft/reply and keep
+                    // the quoted fallback for context instead
+                    let body = if reply_to.is_some() && !is_edit && caps.has("message-tags") {
                         crate::format::strip_reply_fallback(&body)
                     } else {
                         body
@@ -663,6 +644,59 @@ impl Bridge {
                 }
             },
         );
+    }
+
+    /// Initial sync + rebuild of the room→channel mapping. Returns every
+    /// channel-mapped entry (the caller deduplicates against channels it has
+    /// already joined). Runs once per IRC connection after registration, off
+    /// the registration critical path.
+    pub async fn bootstrap_sync(&self) -> anyhow::Result<Vec<RoomEntry>> {
+        self.client
+            .sync_once(SyncSettings::default().ignore_timeout_on_first_sync(true))
+            .await
+            .context("initial matrix sync failed")?;
+        let live: HashSet<OwnedRoomId> = self
+            .client
+            .joined_rooms()
+            .iter()
+            .map(|r| r.room_id().to_owned())
+            .collect();
+        self.rooms.lock().expect("rooms mutex").prune_to(&live);
+        let mut out = Vec::new();
+        for room in self.client.joined_rooms() {
+            if room.is_space() {
+                continue;
+            }
+            let entry = Self::ensure_room_mapping(&self.rooms, &room).await;
+            if entry.query.is_none() {
+                out.push(entry);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Collect invitations that arrived while no connection was active, so
+    /// the caller can prompt for them.
+    pub async fn collect_offline_invites(&self) {
+        let mut idx = self
+            .next_invite_idx
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut invites = Vec::new();
+        for room in self.client.invited_rooms() {
+            idx += 1;
+            let mut inv = describe_invite(&room).await;
+            inv.idx = idx;
+            invites.push(inv);
+        }
+        self.next_invite_idx
+            .store(idx + 1, std::sync::atomic::Ordering::SeqCst);
+        *self.invites.lock().expect("invites mutex") = invites;
+    }
+
+    /// NOTICE prompts for every currently pending invitation.
+    pub fn invite_prompts(&self) -> Vec<Message> {
+        let invites = self.invites.lock().expect("invites mutex").clone();
+        invites.iter().map(|inv| invite_prompt(&self.irc_nick, inv)).collect()
     }
 
     /// Keep the sync loop running in the background. The returned handle
@@ -1221,7 +1255,7 @@ async fn push_topic(
         .await;
 }
 
-async fn sync_forever(client: Client) {
+pub(crate) async fn sync_forever(client: Client) {
     loop {
         tracing::debug!("starting continuous sync");
         if let Err(e) = client.sync(SyncSettings::default()).await {

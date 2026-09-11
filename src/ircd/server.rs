@@ -197,8 +197,10 @@ async fn handle_conn<S: ClientStream>(
         let _ = account;
     }
 
-    // JOIN every mapped room's channel before any PRIVMSG can reference it
-    // (DM/query mappings surface as private messages, not channels)
+    // JOIN every already-mapped room's channel before any PRIVMSG can
+    // reference it (DM/query mappings surface as private messages, not
+    // channels). Rooms first seen on this connection are joined by the
+    // background bootstrap task below.
     for entry in bridge.entries() {
         if entry.query.is_some() {
             continue;
@@ -210,7 +212,15 @@ async fn handle_conn<S: ClientStream>(
 
     let (tx, mut rx) = mpsc::channel::<Message>(256);
     bridge.relay_matrix_to_irc(tx.clone());
-    let sync_task = bridge.spawn_sync();
+    // initial sync + mapping of newly seen rooms must not block registration
+    let sync_task = spawn_bootstrap(
+        Arc::clone(&bridge),
+        tx.clone(),
+        server.clone(),
+        nick.clone(),
+        username.clone(),
+        cfg.bridge.names_limit,
+    );
 
     let result =
         relay_loop(&mut framed, &peer, &server, &prefix, &mut nick, &username, &bridge, &caps, &mut rx, tx)
@@ -1207,6 +1217,55 @@ async fn send_quit<S: ClientStream>(
     Ok(())
 }
 
+/// Background post-registration work: initial sync, JOIN bursts for rooms
+/// first seen on this connection (delivered through `tx` so the relay loop
+/// keeps a single write side), offline invitation prompts, then the endless
+/// sync loop. The returned handle must be aborted when the connection goes
+/// away - it holds the device's sync position and would block the next
+/// session of this user.
+#[allow(clippy::too_many_arguments)]
+fn spawn_bootstrap(
+    bridge: Arc<Bridge>,
+    tx: mpsc::Sender<Message>,
+    server: String,
+    nick: String,
+    username: String,
+    names_limit: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let prefix = client_prefix(&nick, &username);
+        match bridge.bootstrap_sync().await {
+            Ok(fresh) => {
+                for entry in fresh {
+                    let lower = entry.channel.to_ascii_lowercase();
+                    let need_join = {
+                        let mut j = bridge.joined.lock().expect("joined mutex");
+                        if j.contains(&lower) {
+                            false
+                        } else {
+                            j.insert(lower);
+                            true
+                        }
+                    };
+                    if !need_join {
+                        continue;
+                    }
+                    let members = bridge.channel_members(&entry.channel).await.unwrap_or_default();
+                    for m in join_burst_messages(&server, &prefix, &nick, &entry, members, names_limit) {
+                        let _ = tx.send(m).await;
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(nick = %nick, error = %e, "matrix bootstrap sync failed"),
+        }
+        bridge.collect_offline_invites().await;
+        for m in bridge.invite_prompts() {
+            let _ = tx.send(m).await;
+        }
+        crate::bridge::sync_forever(bridge.client.clone()).await;
+    })
+}
+
 async fn matrix_auth<S: ClientStream>(
     framed: &mut Frame<S>,
     cfg: &Arc<Config>,
@@ -1348,28 +1407,46 @@ async fn send_join<S: ClientStream>(
     bridge: &Arc<Bridge>,
     names_limit: usize,
 ) -> Result<()> {
-    let channel = entry.channel.clone();
-    // JOIN is always emitted before any PRIVMSG on that channel
-    framed.send(from_client(prefix, Command::JOIN(channel.clone(), None, None))).await?;
-    framed.send(num(server, Response::RPL_TOPIC, nick, vec![
-        channel.clone(),
-        entry.topic.clone(),
-    ])).await?;
-    send_names(framed, server, nick, &channel, bridge, names_limit).await?;
+    let members = bridge.channel_members(&entry.channel).await.unwrap_or_default();
+    for m in join_burst_messages(server, prefix, nick, entry, members, names_limit) {
+        framed.send(m).await?;
+    }
     Ok(())
 }
 
-/// Send 353/366 for a channel, capped and chunked to keep huge rooms
+/// JOIN + TOPIC + 353/366 lines for one mapped room, as standalone messages
+/// (usable both from the registration burst and the background bootstrap).
+pub fn join_burst_messages(
+    server: &str,
+    prefix: &Prefix,
+    nick: &str,
+    entry: &crate::bridge::rooms::RoomEntry,
+    members: Vec<String>,
+    names_limit: usize,
+) -> Vec<Message> {
+    let channel = entry.channel.clone();
+    let mut out = vec![
+        // JOIN is always emitted before any PRIVMSG on that channel
+        from_client(prefix, Command::JOIN(channel.clone(), None, None)),
+        num(server, Response::RPL_TOPIC, nick, vec![
+            channel.clone(),
+            entry.topic.clone(),
+        ]),
+    ];
+    out.extend(names_messages(server, nick, &channel, members, names_limit));
+    out
+}
+
+/// 353/366 for a channel, capped and chunked to keep huge rooms
 /// from freezing IRC clients.
-async fn send_names<S: ClientStream>(
-    framed: &mut Frame<S>,
+fn names_messages(
     server: &str,
     nick: &str,
     channel: &str,
-    bridge: &Arc<Bridge>,
+    mut members: Vec<String>,
     names_limit: usize,
-) -> Result<()> {
-    let mut members = bridge.channel_members(channel).await.unwrap_or_default();
+) -> Vec<Message> {
+    let mut out = Vec::new();
     if !members.iter().any(|m| m.eq_ignore_ascii_case(nick)) {
         members.push(nick.to_owned());
     }
@@ -1382,11 +1459,11 @@ async fn send_names<S: ClientStream>(
     let mut len = 0usize;
     for m in members {
         if len + m.len() + 1 > 350 && !line.is_empty() {
-            framed.send(num(server, Response::RPL_NAMREPLY, nick, vec![
+            out.push(num(server, Response::RPL_NAMREPLY, nick, vec![
                 "=".to_owned(),
                 channel.to_owned(),
                 line.join(" "),
-            ])).await?;
+            ]));
             line.clear();
             len = 0;
         }
@@ -1394,21 +1471,36 @@ async fn send_names<S: ClientStream>(
         line.push(m);
     }
     if !line.is_empty() {
-        framed.send(num(server, Response::RPL_NAMREPLY, nick, vec![
+        out.push(num(server, Response::RPL_NAMREPLY, nick, vec![
             "=".to_owned(),
             channel.to_owned(),
             line.join(" "),
-        ])).await?;
+        ]));
     }
     let end = if truncated {
         format!("End of /NAMES list (truncated to {names_limit})")
     } else {
         "End of /NAMES list".to_owned()
     };
-    framed.send(num(server, Response::RPL_ENDOFNAMES, nick, vec![
+    out.push(num(server, Response::RPL_ENDOFNAMES, nick, vec![
         channel.to_owned(),
         end,
-    ])).await?;
+    ]));
+    out
+}
+
+async fn send_names<S: ClientStream>(
+    framed: &mut Frame<S>,
+    server: &str,
+    nick: &str,
+    channel: &str,
+    bridge: &Arc<Bridge>,
+    names_limit: usize,
+) -> Result<()> {
+    let members = bridge.channel_members(channel).await.unwrap_or_default();
+    for m in names_messages(server, nick, channel, members, names_limit) {
+        framed.send(m).await?;
+    }
     Ok(())
 }
 

@@ -1,3 +1,7 @@
+// matrix-sdk produces deeply nested async futures; the trait solver needs
+// more room than the default 128 to prove Send across them.
+#![recursion_limit = "512"]
+
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 
 use clap::Parser;
