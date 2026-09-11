@@ -80,7 +80,7 @@ $w.WriteLine('NICK m2078')
 $w.WriteLine('USER m 0 * :https://matrix.doesnmlab.xyz')
 $w.WriteLine('CAP END')
 Check 'welcome 001' (Wait-For ' 001 ' 30)
-Check 'JOIN burst (old rooms stay channels)' (Wait-For '(?m)^:matrix2078 332 m2078 #m2078-plain :.*' 20)
+Check 'JOIN burst (old rooms stay channels)' (Wait-For '(?m)^(@time=[^ ]+ )?:matrix2078 332 m2078 #m2078-plain :.*' 20)
 
 # --- 2. DM: ensure the DM room is joined, then query both ways
 $r1 = Get-Random

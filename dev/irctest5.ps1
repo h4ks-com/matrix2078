@@ -80,7 +80,7 @@ $w.WriteLine('NICK m2078')
 $w.WriteLine('USER m 0 * :https://matrix.doesnmlab.xyz')
 $w.WriteLine('CAP END')
 Check 'welcome 001' (Wait-For ' 001 ' 30)
-Check 'JOIN burst' (Wait-For '(?m)^:matrix2078 332 m2078 #\S+ :.*' 20)
+Check 'JOIN burst' (Wait-For '(?m)^(@time=[^ ]+ )?:matrix2078 332 m2078 #\S+ :.*' 20)
 
 $plainChan = $null
 foreach ($m in [regex]::Matches($out.ToString(), '(?m)332 m2078 (#\S+) :(.*)$')) {

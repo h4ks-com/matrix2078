@@ -201,17 +201,39 @@ async fn handle_conn<S: ClientStream>(
     // reference it (DM/query mappings surface as private messages, not
     // channels). Rooms first seen on this connection are joined by the
     // background bootstrap task below.
-    for entry in bridge.entries() {
-        if entry.query.is_some() {
-            continue;
-        }
-        bridge.joined.lock().expect("joined mutex").insert(entry.channel.to_ascii_lowercase());
-        send_join(&mut framed, &server, &prefix, &nick, &entry, &bridge, cfg.bridge.names_limit)
-            .await?;
-    }
-
+    //
+    // The burst itself also runs in the background: fetching members of
+    // federated rooms can take tens of seconds and must not stall the read
+    // loop (a client PING would go unanswered and the connection die).
     let (tx, mut rx) = mpsc::channel::<Message>(256);
     bridge.relay_matrix_to_irc(tx.clone());
+    {
+        let bridge = Arc::clone(&bridge);
+        let tx = tx.clone();
+        let server = server.clone();
+        let nick = nick.clone();
+        let username = username.clone();
+        let names_limit = cfg.bridge.names_limit;
+        for entry in bridge.entries() {
+            if entry.query.is_some() {
+                continue;
+            }
+            bridge.joined.lock().expect("joined mutex").insert(entry.channel.to_ascii_lowercase());
+        }
+        tokio::spawn(async move {
+            let prefix = client_prefix(&nick, &username);
+            for entry in bridge.entries() {
+                if entry.query.is_some() {
+                    continue;
+                }
+                let members = bridge.channel_members(&entry.channel).await.unwrap_or_default();
+                for m in join_burst_messages(&server, &prefix, &nick, &entry, members, names_limit) {
+                    let _ = tx.send(m).await;
+                }
+            }
+        });
+    }
+
     // initial sync + mapping of newly seen rooms must not block registration
     let sync_task = spawn_bootstrap(
         Arc::clone(&bridge),
@@ -777,7 +799,19 @@ async fn relay_loop<S: ClientStream>(
                                 bridge.joined.lock().expect("joined mutex").insert(chan.to_ascii_lowercase());
                                 let entry = bridge.rooms.lock().expect("rooms mutex")
                                     .get_by_channel(chan).cloned().expect("checked above");
-                                send_join(framed, server, &prefix, nick, &entry, bridge, names_limit).await?;
+                                // member fetch in the background: must not stall PINGs
+                                let bridge2 = Arc::clone(bridge);
+                                let tx = echo_tx.clone();
+                                let server2 = server.to_owned();
+                                let nick2 = nick.to_owned();
+                                let prefix2 = prefix.clone();
+                                let lim = names_limit;
+                                tokio::spawn(async move {
+                                    let members = bridge2.channel_members(&entry.channel).await.unwrap_or_default();
+                                    for m in join_burst_messages(&server2, &prefix2, &nick2, &entry, members, lim) {
+                                        let _ = tx.send(m).await;
+                                    }
+                                });
                             } else {
                                 framed.send(num(server, Response::ERR_NOSUCHCHANNEL, nick, vec![
                                     chan.to_owned(),
