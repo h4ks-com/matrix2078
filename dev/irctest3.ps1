@@ -82,8 +82,8 @@ $w.WriteLine('BATCH +t1 draft/multiline #m2078-plain')
 $w.WriteLine('@draft/multiline=t1 PRIVMSG #m2078-plain :first line')
 $w.WriteLine('@draft/multiline=t1 PRIVMSG #m2078-plain :second line')
 $w.WriteLine('BATCH -t1')
-Check 'multiline batch echoed' (Wait-For '(?s)@time=[^;]+;msgid=[^;]+;draft/multiline=m\.\S+ :m2078!m@matrix2078 PRIVMSG #m2078-plain :first line' 20)
-Check 'multiline echo carries both lines' ($out.ToString() -match '(?s)draft/multiline=m\.\S+ :m2078!m@matrix2078 PRIVMSG #m2078-plain :second line')
+Check 'multiline batch echoed' (Wait-For '(?s)@time=[^;]+;msgid=[^;]+ :m2078!m@matrix2078 BATCH \+m\.\S+ draft/multiline #m2078-plain' 20)
+Check 'multiline echo carries both lines' ($out.ToString() -match '(?s)@batch=m\.\S+[^\r\n]*PRIVMSG #m2078-plain :second line')
 
 # --- 7. CHATHISTORY LATEST
 $w.WriteLine('CHATHISTORY LATEST #m2078-plain * 10')
@@ -125,7 +125,7 @@ $body2 = '{"msgtype":"m.text","body":"peer multi head\npeer multi tail"}'
 $txn2 = "m2e2em$(Get-Date -Format yyyyMMddHHmmss)"
 Invoke-RestMethod -Method Put -Uri "$hs/_matrix/client/v3/rooms/$room/send/m.room.message/$txn2`?access_token=$tok" -Body $body2 -ContentType 'application/json' | Out-Null
 Check 'peer multiline batch down' (Wait-For 'BATCH \+m\.\S+ draft/multiline #m2078-plain' 30)
-Check 'peer multiline lines relayed' (Wait-For '(?s)@time=[^;]+;msgid=[^;]+;draft/multiline=m\.\S+ :m2078-peer!matrix@matrix PRIVMSG #m2078-plain :peer multi tail' 15)
+Check 'peer multiline lines relayed' (Wait-For '(?s)@batch=m\.\S+[^\r\n]*:m2078-peer!matrix@matrix PRIVMSG #m2078-plain :peer multi tail' 15)
 
 $c.Close()
 New-Item -ItemType Directory -Force -Path (Split-Path $OutFile) | Out-Null

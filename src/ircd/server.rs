@@ -576,6 +576,7 @@ fn tags_for_client(caps: &Caps, m: Message) -> Message {
             "time" => caps.has("server-time"),
             "msgid" => caps.has("msgid") || caps.has("message-tags"),
             "account" => caps.has("account-tag"),
+            "batch" => caps.has("batch"),
             other => caps.has("message-tags") && (other.starts_with("draft/") || other.starts_with('+')),
         })
         .collect();
@@ -583,10 +584,12 @@ fn tags_for_client(caps: &Caps, m: Message) -> Message {
 }
 
 /// A `draft/multiline` batch being accumulated from the client.
+/// Each line carries its text and whether it must be concatenated to the
+/// previous one without a line break (`draft/multiline-concat`).
 struct MultiLine {
     target: String,
     notice: bool,
-    lines: Vec<String>,
+    lines: Vec<(String, bool)>,
     reply: Option<String>,
 }
 
@@ -663,9 +666,21 @@ async fn relay_loop<S: ClientStream>(
                     bridge.joined.lock().expect("joined mutex").contains(&chan.to_ascii_lowercase())
                 };
                 // messages continuing an open draft/multiline batch
-                if let Some(ml_ref) = msg.tags.as_ref().and_then(|tags| {
-                    tags.iter().find(|t| t.0 == "draft/multiline").and_then(|t| t.1.clone())
-                }) {
+                // (current spec marks lines with batch=<ref>; the old
+                // draft/multiline=<ref> client tag is still accepted)
+                let ml_ref = msg.tags.as_ref().and_then(|tags| {
+                    let batch = tags
+                        .iter()
+                        .find(|t| t.0 == "batch")
+                        .and_then(|t| t.1.clone());
+                    if let Some(b) = batch {
+                        return Some(b);
+                    }
+                    tags.iter()
+                        .find(|t| t.0 == "draft/multiline")
+                        .and_then(|t| t.1.clone())
+                });
+                if let Some(ml_ref) = ml_ref {
                     match &msg.command {
                         Command::PRIVMSG(target, body) | Command::NOTICE(target, body) => {
                             if let Some(ml) = multiline.get_mut(&ml_ref) {
@@ -674,10 +689,16 @@ async fn relay_loop<S: ClientStream>(
                                     if ml.target.is_empty() {
                                         ml.target = target.clone();
                                     }
-                                    // reply tag of the first line applies to the whole batch
-                                    ml.reply = tag_value(&msg, "+draft/reply");
+                                    // legacy reply tag on the first line applies too
+                                    if ml.reply.is_none() {
+                                        ml.reply = tag_value(&msg, "+draft/reply");
+                                    }
                                 }
-                                ml.lines.push(body.clone());
+                                let concat = msg.tags.as_ref().is_some_and(|tags| {
+                                    tags.iter()
+                                        .any(|t| t.0 == "draft/multiline-concat")
+                                });
+                                ml.lines.push((body.clone(), concat));
                                 continue;
                             }
                         }
@@ -747,7 +768,8 @@ async fn relay_loop<S: ClientStream>(
                         }
                     }
                     Command::BATCH(ref_name, sub, args) => {
-                        handle_batch(framed, server, nick, &prefix, &mut multiline, bridge, caps, &echo_tx, &ref_name, sub, args).await?;
+                        let reply_on_open = reply_tag.clone();
+                        handle_batch(framed, server, nick, &prefix, &mut multiline, bridge, caps, &echo_tx, &ref_name, sub, args, reply_on_open).await?;
                     }
                     Command::JOIN(chans, _, _) => {
                         for chan in chans.split(',').filter(|c| !c.is_empty()) {
@@ -1011,6 +1033,7 @@ async fn handle_batch<S: ClientStream>(
     ref_name: &str,
     sub: Option<irc::proto::BatchSubCommand>,
     args: Option<Vec<String>>,
+    reply_on_open: Option<String>,
 ) -> Result<()> {
     let _ = framed;
     // close (-ref) carries no subcommand: it must be handled before
@@ -1018,9 +1041,21 @@ async fn handle_batch<S: ClientStream>(
     if let Some(reference) = ref_name.strip_prefix('-') {
         if let Some(ml) = multiline.remove(reference) {
             tracing::debug!(reference, target = %ml.target, lines = ml.lines.len(), "flushing multiline batch");
-            let body = ml.lines.join("\n");
+            // spec join: lines are separated by \n unless the line carried
+            // draft/multiline-concat, which joins directly
+            let mut body = String::new();
+            for (i, (text, concat)) in ml.lines.iter().enumerate() {
+                if i > 0 && !concat {
+                    body.push('\n');
+                }
+                body.push_str(text);
+            }
             let reply = ml.reply.clone();
-            relay_from_irc(bridge, nick, prefix, &ml.target, body, ml.notice, true, true, caps, echo_tx, reply).await?;
+            if ml.target.starts_with('#') {
+                relay_from_irc(bridge, nick, prefix, &ml.target, body, ml.notice, true, true, caps, echo_tx, reply).await?;
+            } else {
+                relay_query_from_irc(bridge, nick, prefix, &ml.target, body, ml.notice, caps, echo_tx, reply).await?;
+            }
         }
         return Ok(());
     }
@@ -1031,7 +1066,9 @@ async fn handle_batch<S: ClientStream>(
     if is_multiline {
         let target = args.as_ref().and_then(|a| a.first().cloned()).unwrap_or_default();
         tracing::debug!(reference, %target, "opening multiline batch");
-        multiline.insert(reference.to_owned(), MultiLine { target, notice: false, lines: Vec::new(), reply: None });
+        // the spec puts client-only tags (e.g. +draft/reply) on the opening
+        // BATCH command, not on the lines
+        multiline.insert(reference.to_owned(), MultiLine { target, notice: false, lines: Vec::new(), reply: reply_on_open });
     }
     Ok(())
 }

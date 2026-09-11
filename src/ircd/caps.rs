@@ -25,7 +25,8 @@ pub const SUPPORTED: &[(&str, Option<&str>)] = &[
     ("userhost-in-names", None),
     ("sasl", Some("PLAIN")),
     ("draft/chathistory", None),
-    ("draft/multiline", None),
+    // spec REQUIRED value: max-bytes[,max-lines]
+    ("draft/multiline", Some("max-bytes=4096,max-lines=32")),
     ("draft/message-redaction", None),
 ];
 

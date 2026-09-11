@@ -1107,12 +1107,20 @@ fn body_to_irc(
         }
         tags
     };
-
-    if caps.has("draft/multiline") && caps.has("batch") && caps.has("message-tags") {
-        // one batch per message, ref derived from the event id
+    if lines.len() > 1 && caps.has("draft/multiline") && caps.has("batch") && caps.has("message-tags") {
+        // one batch per message, ref derived from the event id; per spec the
+        // msgid/time/reply tags ride the opening BATCH and each line is
+        // marked with the server-side batch=<ref> tag
         let reference = format!("m.{}", msgid.trim_start_matches('$'));
+        let mut open_tags = vec![proto::time_tag(ts), proto::msgid_tag(msgid)];
+        if let Some(reply) = reply_to {
+            open_tags.push(irc::proto::message::Tag(
+                "+draft/reply".to_owned(),
+                Some(reply.to_owned()),
+            ));
+        }
         let mut out = vec![Message {
-            tags: None,
+            tags: Some(open_tags),
             prefix: Some(sender.clone()),
             command: Command::Raw(
                 "BATCH".to_owned(),
@@ -1125,7 +1133,10 @@ fn body_to_irc(
         }];
         for line in lines {
             let m = Message {
-                tags: Some(tags_for(Some(&reference))),
+                tags: Some(vec![irc::proto::message::Tag(
+                    "batch".to_owned(),
+                    Some(reference.clone()),
+                )]),
                 prefix: Some(sender.clone()),
                 command: mk_cmd(line),
             };
@@ -1138,8 +1149,10 @@ fn body_to_irc(
         });
         out
     } else {
+        // fallback: one PRIVMSG per line; blank lines are not allowed here
         lines
             .into_iter()
+            .filter(|l| !l.trim().is_empty())
             .map(|line| Message {
                 tags: Some(tags_for(None)),
                 prefix: Some(sender.clone()),
