@@ -903,18 +903,16 @@ async fn relay_loop<S: ClientStream>(
                     }
                     Command::WHO(Some(mask), _) => {
                         if known_channel(&mask) {
-                            // fetch members off the read loop: a slow
-                            // homeserver must not stall PING/PONG
-                            let bridge2 = Arc::clone(bridge);
-                            let tx = tx.clone();
+                            // self-only WHO reply (see who_messages): no member
+                            // fetch, nothing may stall the read loop
                             let server2 = server.to_owned();
                             let nick2 = nick.to_owned();
                             let mask2 = mask.clone();
                             let lim = names_limit;
+                            let tx2 = tx.clone();
                             tokio::spawn(async move {
-                                let members = bridge2.channel_members(&mask2).await.unwrap_or_default();
-                                for m in who_messages(&server2, &nick2, &mask2, &members, lim) {
-                                    let _ = tx.send(m).await;
+                                for m in who_messages(&server2, &nick2, &mask2, &[], lim) {
+                                    let _ = tx2.send(m).await;
                                 }
                             });
                         } else {
@@ -1699,7 +1697,16 @@ fn who_messages(
     names_limit: usize,
 ) -> Vec<Message> {
     let mut out = Vec::new();
-    for member in members.iter().take(names_limit) {
+    // Like other bouncers (soju): WHO on a channel reports only the asking
+    // client itself. Members come from NAMES; returning hundreds of lines per
+    // poll drowns bouncers that poll WHO for away state.
+    let own = members
+        .iter()
+        .find(|m| m.eq_ignore_ascii_case(nick))
+        .cloned()
+        .unwrap_or_else(|| nick.to_owned());
+    let entries: Vec<String> = vec![own];
+    for member in entries.iter().take(names_limit.max(1)) {
         out.push(num(server, Response::RPL_WHOREPLY, nick, vec![
             channel.to_owned(),
             member.clone(),
