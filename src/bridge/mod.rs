@@ -73,6 +73,15 @@ pub struct Bridge {
     sent: Arc<Mutex<HashSet<String>>>,
 }
 
+/// Result of a nick → avatar lookup for `draft/metadata-2`.
+pub enum AvatarLookup {
+    /// Nick resolves to a known user; the URL is set only when they
+    /// actually have an avatar.
+    Found(Option<String>),
+    /// Nick does not resolve to any mapped room participant.
+    NotFound,
+}
+
 impl Bridge {
     /// Log in / restore the Matrix session and load the stored room→channel
     /// mapping. This is deliberately fast: the initial sync and the mapping of
@@ -192,6 +201,77 @@ impl Bridge {
                 .map(|m| proto::mxid_to_nick(m.user_id().as_str()))
                 .collect(),
         )
+    }
+
+    /// Local signed URL of `target_nick`'s Matrix avatar.
+    ///
+    /// Other users' avatars come from the local state store only
+    /// (`members_no_sync`): a network-fetched member list per room would
+    /// stall METADATA replies for minutes on cold sessions. Our own avatar
+    /// comes from the profile API, which works before the first sync. The
+    /// avatar image itself is fetched with authenticated media and cached on
+    /// disk, so the URL is stable and never exposes a raw `mxc://` or
+    /// homeserver endpoint to the IRC client.
+    pub async fn lookup_avatar(&self, target_nick: &str) -> Result<AvatarLookup> {
+        let started = std::time::Instant::now();
+        let result = self.lookup_avatar_inner(target_nick).await;
+        tracing::debug!(
+            target = target_nick,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            found = matches!(result, Ok(AvatarLookup::Found(Some(_)))),
+            "avatar lookup done"
+        );
+        result
+    }
+
+    async fn lookup_avatar_inner(&self, target_nick: &str) -> Result<AvatarLookup> {
+        if self.is_own_nick(target_nick) {
+            let profile = self
+                .client
+                .account()
+                .fetch_user_profile_of(&self.own_mxid)
+                .await
+                .context("fetching own profile")?;
+            let uri = profile
+                .get_static::<matrix_sdk::ruma::api::client::profile::AvatarUrl>()
+                .context("parsing profile avatar")?;
+            return match uri {
+                Some(uri) => Ok(AvatarLookup::Found(Some(self.cache_avatar(&uri).await?))),
+                None => Ok(AvatarLookup::Found(None)),
+            };
+        }
+        // other users: member events from the local store only
+        let mut found: Option<Option<matrix_sdk::ruma::OwnedMxcUri>> = None;
+        for entry in self.entries() {
+            let Some(room) = self.client.get_room(&entry.room_id) else { continue };
+            let Ok(members) = room.members_no_sync(matrix_sdk::RoomMemberships::JOIN).await else { continue };
+            if let Some(m) = members.iter().find(|m| {
+                proto::mxid_to_nick(m.user_id().as_str()).eq_ignore_ascii_case(target_nick)
+            }) {
+                found = Some(m.avatar_url().map(|u| u.to_owned()));
+                break;
+            }
+        }
+        match found {
+            Some(uri) => match uri {
+                Some(uri) => Ok(AvatarLookup::Found(Some(self.cache_avatar(&uri).await?))),
+                None => Ok(AvatarLookup::Found(None)),
+            },
+            None => Ok(AvatarLookup::NotFound),
+        }
+    }
+
+    /// Download an avatar mxc into the media cache, returning the signed
+    /// local URL.
+    async fn cache_avatar(&self, uri: &matrix_sdk::ruma::MxcUri) -> Result<String> {
+        let dir = crate::matrix::media::cache_dir(&self.cfg.state_dir);
+        let name = crate::matrix::media::fetch_avatar_to_cache(&self.client, &dir, uri).await?;
+        Ok(self.media.url_for(&name))
+    }
+
+    fn is_own_nick(&self, nick: &str) -> bool {
+        nick.eq_ignore_ascii_case(&self.irc_nick)
+            || nick.eq_ignore_ascii_case(proto::mxid_to_nick(self.own_mxid.as_str()).as_str())
     }
 
     /// Register event handlers pushing relayed IRC lines into `tx`.

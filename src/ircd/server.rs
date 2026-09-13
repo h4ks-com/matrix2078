@@ -737,6 +737,9 @@ async fn relay_loop<S: ClientStream>(
     let names_limit = bridge.cfg.bridge.names_limit;
     let mut multiline: HashMap<String, MultiLine> = HashMap::new();
     let batch_counter = AtomicU64::new(0);
+    // per-connection draft/metadata-2 key subscriptions
+    let metadata_subs: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let tx = tx.clone();
     let prio_tx = prio_tx.clone();
     loop {
@@ -1019,8 +1022,41 @@ async fn relay_loop<S: ClientStream>(
                         }
                     }
                     Command::MOTD(_) => {
-                        for m in motd(server, nick) {
-                            let _ = tx.send(m).await;
+                        // draft/metadata-2: the client's own metadata batch is
+                        // part of the registration burst, before ENDOFMOTD.
+                        // The avatar fetch may hit the network → off the read
+                        // loop, ordered through the shared mpsc.
+                        let lines = motd(server, nick);
+                        let end = lines.last().cloned().unwrap();
+                        for m in &lines[..lines.len() - 1] {
+                            let _ = tx.send(m.clone()).await;
+                        }
+                        if caps.has("draft/metadata-2") {
+                            let bridge2 = Arc::clone(bridge);
+                            let tx2 = tx.clone();
+                            let server2 = server.to_owned();
+                            let nick2 = nick.to_owned();
+                            tokio::spawn(async move {
+                                let avatar = match bridge2.lookup_avatar(&nick2).await {
+                                    Ok(crate::bridge::AvatarLookup::Found(url)) => url,
+                                    _ => None,
+                                };
+                                for m in metadata_batch(
+                                    &server2,
+                                    "mdmotd",
+                                    &nick2,
+                                    &nick2,
+                                    vec![("avatar".to_owned(), match avatar {
+                                        Some(u) => MdValue::Value(u),
+                                        None => MdValue::NotSet,
+                                    })],
+                                ) {
+                                    let _ = tx2.send(m).await;
+                                }
+                                let _ = tx2.send(end).await;
+                            });
+                        } else {
+                            let _ = tx.send(end).await;
                         }
                     }
                     Command::LUSERS(..) => {
@@ -1103,6 +1139,26 @@ async fn relay_loop<S: ClientStream>(
                                 tracing::warn!(error = %e, "chathistory failed");
                             }
                         });
+                    }
+                    Command::METADATA(target, sub, params) => {
+                        // irc-proto models the legacy subcommands natively and
+                        // includes the subcommand itself in `params`; newer
+                        // subcommands (SUB/UNSUB/SUBS/SYNC) arrive as Raw
+                        let mut args = vec![target];
+                        match params {
+                            Some(p) if !p.is_empty() => args.extend(p),
+                            _ => {
+                                if let Some(sub) = sub {
+                                    args.push(sub.to_str().to_owned());
+                                }
+                            }
+                        }
+                        run_metadata(bridge, &tx, server, nick, &metadata_subs, &batch_counter, args);
+                    }
+                    Command::Raw(cmd, args) if cmd.eq_ignore_ascii_case("METADATA") => {
+                        // avatar lookups hit the matrix state store (and the
+                        // network on cache misses): keep the read loop free
+                        run_metadata(bridge, &tx, server, nick, &metadata_subs, &batch_counter, args);
                     }
                     Command::Response(..) | Command::Raw(..) => {}
                     other => {
@@ -1253,6 +1309,333 @@ fn fail_chathistory(server: &str, _nick: &str, code: &str, target: &str, ctx: &s
         target.to_owned(),
         ctx.to_owned(),
     ]))
+}
+
+// ---------------- draft/metadata-2 ----------------
+//
+// Read-only metadata: the `avatar` key maps to the user's Matrix avatar,
+// served as a signed URL from the local media cache. SET/CLEAR are refused;
+// SUB/UNSUB/SUBS are tracked per connection (no push notifications yet).
+
+/// Per-connection subscription limit; advertised in the cap value.
+const METADATA_MAX_SUBS: usize = 16;
+
+/// `FAIL METADATA <code> [params] :<context>` standard reply.
+fn fail_metadata(server: &str, code: &str, params: &[&str], ctx: &str) -> Message {
+    let mut args = vec!["METADATA".to_owned(), code.to_owned()];
+    args.extend(params.iter().map(|p| (*p).to_owned()));
+    args.push(ctx.to_owned());
+    srv(server, Command::Raw("FAIL".to_owned(), args))
+}
+
+/// A numeric from the metadata range (760-775), addressed to `client`.
+fn md_num(server: &str, code: &str, client: &str, args: Vec<String>) -> Message {
+    let mut full = vec![client.to_owned()];
+    full.extend(args);
+    srv(server, Command::Raw(code.to_owned(), full))
+}
+
+/// Tag a message as belonging to batch `ref_id`.
+fn with_batch_tag(ref_id: &str, mut m: Message) -> Message {
+    m.tags
+        .get_or_insert_with(Vec::new)
+        .push(Tag("batch".to_owned(), Some(ref_id.to_owned())));
+    m
+}
+
+/// The value of a metadata key in a batch.
+enum MdValue {
+    Value(String),
+    NotSet,
+    Invalid,
+}
+
+/// `BATCH +<ref> metadata <target>` … enclosed 761/766/FAIL lines … close.
+fn metadata_batch(
+    server: &str,
+    ref_id: &str,
+    client: &str,
+    target: &str,
+    entries: Vec<(String, MdValue)>,
+) -> Vec<Message> {
+    let mut out = vec![srv(server, Command::Raw("BATCH".to_owned(), vec![
+        format!("+{ref_id}"),
+        "metadata".to_owned(),
+        target.to_owned(),
+    ]))];
+    for (key, value) in entries {
+        out.push(with_batch_tag(ref_id, match value {
+            MdValue::Value(v) => md_num(server, "761", client, vec![
+                target.to_owned(),
+                key,
+                "*".to_owned(),
+                v,
+            ]),
+            MdValue::NotSet => md_num(server, "766", client, vec![
+                target.to_owned(),
+                key,
+                "key not set".to_owned(),
+            ]),
+            MdValue::Invalid => fail_metadata(server, "KEY_INVALID", &[&key], "invalid key"),
+        }));
+    }
+    out.push(srv(server, Command::Raw("BATCH".to_owned(), vec![format!("-{ref_id}")])));
+    out
+}
+
+/// Key names are restricted to `a-z`, `0-9`, `_./-` (draft/metadata-2).
+fn valid_metadata_key(k: &str) -> bool {
+    !k.is_empty()
+        && k.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '/' | '-')
+        })
+}
+
+/// Spawn [`handle_metadata`] off the read loop (avatar fetches may hit the
+/// network; PINGs must never wait for them).
+fn run_metadata(
+    bridge: &Arc<Bridge>,
+    tx: &mpsc::Sender<Message>,
+    server: &str,
+    nick: &str,
+    subs: &Arc<std::sync::Mutex<Vec<String>>>,
+    counter: &AtomicU64,
+    args: Vec<String>,
+) {
+    let bridge2 = Arc::clone(bridge);
+    let tx = tx.clone();
+    let server2 = server.to_owned();
+    let nick2 = nick.to_owned();
+    let subs2 = Arc::clone(subs);
+    let ref_id = format!("md{}", counter.fetch_add(1, Ordering::Relaxed));
+    tokio::spawn(async move {
+        if let Err(e) = handle_metadata(tx, &server2, &nick2, &bridge2, &subs2, ref_id, args).await {
+            tracing::warn!(error = %e, "metadata failed");
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_metadata(
+    tx: mpsc::Sender<Message>,
+    server: &str,
+    nick: &str,
+    bridge: &Arc<Bridge>,
+    subs: &Arc<std::sync::Mutex<Vec<String>>>,
+    ref_id: String,
+    args: Vec<String>,
+) -> Result<()> {
+    let Some(target) = args.first().cloned() else {
+        let _ = tx.send(fail_metadata(server, "INVALID_TARGET", &["*"], "invalid metadata target")).await;
+        return Ok(());
+    };
+    // `*` always means the asking client
+    let resolved = if target == "*" { nick.to_owned() } else { target };
+    let sub = args.get(1).cloned().unwrap_or_default();
+
+    // channels are valid (but empty) targets only when they are known
+    let channel_ok = |t: &str| -> bool {
+        bridge.rooms.lock().expect("rooms mutex").get_by_channel(t).is_some()
+    };
+
+    match sub.to_uppercase().as_str() {
+        "GET" => {
+            let keys: Vec<String> = args.iter().skip(2).cloned().collect();
+            if keys.is_empty() {
+                let _ = tx.send(fail_metadata(server, "KEY_INVALID", &["*"], "no keys requested")).await;
+                return Ok(());
+            }
+            if resolved.starts_with('#') {
+                if !channel_ok(&resolved) {
+                    let _ = tx.send(fail_metadata(server, "INVALID_TARGET", &[&resolved], "invalid metadata target")).await;
+                    return Ok(());
+                }
+                // channels carry no metadata here
+                let entries = keys.into_iter().map(|k| {
+                    let v = if valid_metadata_key(&k) { MdValue::NotSet } else { MdValue::Invalid };
+                    (k, v)
+                }).collect();
+                for m in metadata_batch(server, &ref_id, nick, &resolved, entries) {
+                    let _ = tx.send(m).await;
+                }
+                return Ok(());
+            }
+            match bridge.lookup_avatar(&resolved).await {
+                Err(e) => {
+                    tracing::warn!(error = %e, "avatar lookup failed");
+                    let entries = keys
+                        .into_iter()
+                        .map(|k| (k, MdValue::NotSet))
+                        .collect();
+                    for m in metadata_batch(server, &ref_id, nick, &resolved, entries) {
+                        let _ = tx.send(m).await;
+                    }
+                }
+                Ok(crate::bridge::AvatarLookup::NotFound) => {
+                    let _ = tx.send(fail_metadata(server, "INVALID_TARGET", &[&resolved], "invalid metadata target")).await;
+                }
+                Ok(crate::bridge::AvatarLookup::Found(avatar)) => {
+                    let entries = keys
+                        .into_iter()
+                        .map(|k| {
+                            let v = if !valid_metadata_key(&k) {
+                                MdValue::Invalid
+                            } else if k == "avatar" {
+                                match &avatar {
+                                    Some(u) => MdValue::Value(u.clone()),
+                                    None => MdValue::NotSet,
+                                }
+                            } else {
+                                MdValue::NotSet
+                            };
+                            (k, v)
+                        })
+                        .collect();
+                    for m in metadata_batch(server, &ref_id, nick, &resolved, entries) {
+                        let _ = tx.send(m).await;
+                    }
+                }
+            }
+        }
+        "LIST" => {
+            if resolved.starts_with('#') {
+                if !channel_ok(&resolved) {
+                    let _ = tx.send(fail_metadata(server, "INVALID_TARGET", &[&resolved], "invalid metadata target")).await;
+                    return Ok(());
+                }
+                for m in metadata_batch(server, &ref_id, nick, &resolved, vec![]) {
+                    let _ = tx.send(m).await;
+                }
+                return Ok(());
+            }
+            match bridge.lookup_avatar(&resolved).await {
+                Err(e) => {
+                    tracing::warn!(error = %e, "avatar lookup failed");
+                    for m in metadata_batch(server, &ref_id, nick, &resolved, vec![]) {
+                        let _ = tx.send(m).await;
+                    }
+                }
+                Ok(crate::bridge::AvatarLookup::NotFound) => {
+                    let _ = tx.send(fail_metadata(server, "INVALID_TARGET", &[&resolved], "invalid metadata target")).await;
+                }
+                Ok(crate::bridge::AvatarLookup::Found(avatar)) => {
+                    let entries = match avatar {
+                        Some(u) => vec![("avatar".to_owned(), MdValue::Value(u))],
+                        None => vec![],
+                    };
+                    for m in metadata_batch(server, &ref_id, nick, &resolved, entries) {
+                        let _ = tx.send(m).await;
+                    }
+                }
+            }
+        }
+        "SET" => {
+            let key = args.get(2).cloned().unwrap_or_else(|| "*".to_owned());
+            let _ = tx.send(fail_metadata(server, "KEY_NO_PERMISSION", &[&resolved, &key], "avatars come from your Matrix profile")).await;
+        }
+        "CLEAR" => {
+            let _ = tx.send(fail_metadata(server, "KEY_NO_PERMISSION", &[&resolved, "*"], "avatars come from your Matrix profile")).await;
+        }
+        "SUB" => {
+            let keys: Vec<String> = args.iter().skip(2).cloned().collect();
+            if keys.is_empty() {
+                let _ = tx.send(fail_metadata(server, "KEY_INVALID", &["*"], "no keys requested")).await;
+                return Ok(());
+            }
+            let mut ok: Vec<String> = Vec::new();
+            for k in keys {
+                if !valid_metadata_key(&k) {
+                    let _ = tx.send(fail_metadata(server, "KEY_INVALID", &[&k], "invalid key")).await;
+                    continue;
+                }
+                let limit_reached = {
+                    let mut s = subs.lock().expect("metadata subs mutex");
+                    if s.contains(&k) {
+                        false
+                    } else if s.len() >= METADATA_MAX_SUBS {
+                        true
+                    } else {
+                        s.push(k.clone());
+                        false
+                    }
+                };
+                if limit_reached {
+                    let _ = tx.send(fail_metadata(server, "TOO_MANY_SUBS", &[&k], "too many subscriptions")).await;
+                    break;
+                }
+                ok.push(k);
+            }
+            if !ok.is_empty() {
+                let _ = tx.send(md_num(server, "770", nick, ok)).await;
+            }
+        }
+        "UNSUB" => {
+            let keys: Vec<String> = args.iter().skip(2).cloned().collect();
+            if keys.is_empty() {
+                let _ = tx.send(fail_metadata(server, "KEY_INVALID", &["*"], "no keys requested")).await;
+                return Ok(());
+            }
+            let mut ok: Vec<String> = Vec::new();
+            for k in keys {
+                if !valid_metadata_key(&k) {
+                    let _ = tx.send(fail_metadata(server, "KEY_INVALID", &[&k], "invalid key")).await;
+                    continue;
+                }
+                subs.lock().expect("metadata subs mutex").retain(|s| *s != k);
+                ok.push(k);
+            }
+            if !ok.is_empty() {
+                let _ = tx.send(md_num(server, "771", nick, ok)).await;
+            }
+        }
+        "SUBS" => {
+            let current = subs.lock().expect("metadata subs mutex").clone();
+            let mut msgs = vec![srv(server, Command::Raw("BATCH".to_owned(), vec![
+                format!("+{ref_id}"),
+                "metadata-subs".to_owned(),
+            ]))];
+            if !current.is_empty() {
+                msgs.push(with_batch_tag(&ref_id, md_num(server, "772", nick, current)));
+            }
+            msgs.push(srv(server, Command::Raw("BATCH".to_owned(), vec![format!("-{ref_id}")])));
+            for m in msgs {
+                let _ = tx.send(m).await;
+            }
+        }
+        "SYNC" => {
+            if resolved.starts_with('#') || bridge.lookup_avatar(&resolved).await.map(|l| matches!(l, crate::bridge::AvatarLookup::NotFound)).unwrap_or(true) {
+                let _ = tx.send(fail_metadata(server, "INVALID_TARGET", &[&resolved], "invalid metadata target")).await;
+                return Ok(());
+            }
+            let current = subs.lock().expect("metadata subs mutex").clone();
+            let mut msgs = vec![srv(server, Command::Raw("BATCH".to_owned(), vec![
+                format!("+{ref_id}"),
+                "metadata".to_owned(),
+                resolved.clone(),
+            ]))];
+            for k in &current {
+                if k != "avatar" {
+                    continue;
+                }
+                if let Ok(crate::bridge::AvatarLookup::Found(Some(url))) = bridge.lookup_avatar(&resolved).await {
+                    msgs.push(with_batch_tag(&ref_id, srv(server, Command::Raw("METADATA".to_owned(), vec![
+                        resolved.clone(),
+                        k.clone(),
+                        "*".to_owned(),
+                        url,
+                    ]))));
+                }
+            }
+            msgs.push(srv(server, Command::Raw("BATCH".to_owned(), vec![format!("-{ref_id}")])));
+            for m in msgs {
+                let _ = tx.send(m).await;
+            }
+        }
+        other => {
+            let _ = tx.send(fail_metadata(server, "SUBCOMMAND_INVALID", &[other], "invalid subcommand")).await;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -28,6 +28,9 @@ pub const SUPPORTED: &[(&str, Option<&str>)] = &[
     // spec REQUIRED value: max-bytes[,max-lines]
     ("draft/multiline", Some("max-bytes=4096,max-lines=32")),
     ("draft/message-redaction", None),
+    // draft/metadata-2: read-only key `avatar` served from the local media
+    // cache; value advertises the per-connection subscription limit
+    ("draft/metadata-2", Some("max-subs=16")),
 ];
 
 /// Capabilities negotiated for a single connection.
@@ -97,7 +100,7 @@ mod tests {
     #[test]
     fn ls_contains_core_caps() {
         let ls = Caps::ls();
-        for c in ["server-time", "echo-message", "message-tags", "sasl=PLAIN", "draft/chathistory", "draft/multiline"] {
+        for c in ["server-time", "echo-message", "message-tags", "sasl=PLAIN", "draft/chathistory", "draft/multiline", "draft/metadata-2=max-subs=16"] {
             assert!(ls.contains(c), "missing {c} in {ls}");
         }
     }
