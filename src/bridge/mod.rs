@@ -627,10 +627,17 @@ impl Bridge {
                     }
                     let nick = proto::mxid_to_nick(ev.sender.as_str());
                     let ts = u64::from(ev.origin_server_ts.get());
+                    if !relayable_reaction_key(&ann.key) {
+                        // custom emotes (mxc://, :shortcodes:) and arbitrary
+                        // text break reaction UIs downstream — drop them
+                        tracing::debug!(key = %ann.key, sender = %ev.sender, "dropping non-emoji reaction");
+                        return;
+                    }
                     let mut m = proto::user(&nick, Command::Raw("TAGMSG".to_owned(), vec![entry.channel]));
                     m.tags = Some(vec![
                         proto::time_tag(ts),
                         proto::msgid_tag(&ev.event_id.to_string()),
+                        proto::account_tag(ev.sender.as_str()),
                         irc::proto::message::Tag(
                             "+draft/reply".to_owned(),
                             Some(ann.event_id.to_string()),
@@ -1087,6 +1094,9 @@ impl Bridge {
 
     /// Send a reaction (`+draft/react` TAGMSG) as an m.reaction annotation.
     pub async fn send_reaction(&self, channel: &str, target: &str, key: &str) -> Result<()> {
+        if !relayable_reaction_key(key) {
+            anyhow::bail!("not a unicode emoji reaction key: {key:?}");
+        }
         let room_id = {
             let maps = self.rooms.lock().expect("rooms mutex");
             maps.get_by_channel(channel).map(|e| e.room_id.clone())
@@ -1311,6 +1321,48 @@ fn chunks(s: &str, width: usize) -> Vec<&str> {
         start = end;
     }
     out
+}
+
+/// Whether an `m.reaction` key is a plain unicode emoji sequence IRC clients
+/// can render. Matrix allows arbitrary keys — custom emotes arrive as
+/// `mxc://` URIs or `:shortcode:`-style names, and some clients send raw
+/// text — which break reaction UIs downstream (Discord expects real emoji),
+/// so only unicode emoji sequences are relayed in either direction.
+fn relayable_reaction_key(key: &str) -> bool {
+    let mut points = 0usize;
+    for c in key.chars() {
+        let x = c as u32;
+        let emoji = matches!(x,
+            // keycap bases: # * 0-9
+            0x23 | 0x2A | 0x30..=0x39
+            // zero-width joiner, variation selectors, enclosing keycap
+            | 0x200D | 0xFE0E | 0xFE0F | 0x20E3
+            // regional indicators (flags)
+            | 0x1F1E6..=0x1F1FF
+            // misc symbols and pictographs that predate the SMP emoji blocks
+            | 0x203C | 0x2049            // ‼ ⁉
+            | 0x2122 | 0x2139            // ™ ℹ
+            | 0x2194..=0x21AA            // arrows
+            | 0x231A..=0x231B            // ⌚ ⌛
+            | 0x2328 | 0x23CF            // ⌨ ⏏
+            | 0x23E9..=0x23FA            // media controls
+            | 0x24C2                     // Ⓜ
+            | 0x25AA..=0x25AB | 0x25B6 | 0x25C0
+            | 0x25FB..=0x25FE
+            | 0x2600..=0x27BF            // misc symbols + dingbats (❤ ✔ ✨ …)
+            | 0x2934..=0x2935 | 0x2B00..=0x2BFF // ⤴ ⬆ ★ …
+            // supplementary emoji planes: cards, skin tones, emoticons,
+            // transport, misc supp. symbols/pictographs, supplemental
+            // symbols, and the newer extensions
+            | 0x1F000..=0x1FAFF
+            | 0x1FB00..=0x1FBFF
+        );
+        if !emoji {
+            return false;
+        }
+        points += 1;
+    }
+    points > 0 && points <= 16 && key.len() <= 75
 }
 
 /// Best-effort description of an invited room for the IRC prompt.
@@ -1806,4 +1858,42 @@ async fn localize_mxc(
     }
     out.push_str(&body[last..]);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_emoji_reaction_keys_are_relayed() {
+        for ok in [
+            "\u{1f44d}",                      // 👍
+            "\u{2764}\u{fe0f}",                // ❤️
+            "\u{1f525}",                       // 🔥
+            "\u{1f1f7}\u{1f1fa}",              // 🇷🇺
+            "\u{1f44d}\u{1f3fd}",              // 👍🏽 (skin tone)
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}", // 👨‍👩‍👧‍👦 (ZWJ)
+            "1\u{fe0f}\u{20e3}",               // 1️⃣ (keycap)
+            "\u{2728}",                        // ✨
+            "\u{2615}",                        // ☕
+        ] {
+            assert!(relayable_reaction_key(ok), "should relay {ok:?}");
+        }
+    }
+
+    #[test]
+    fn custom_and_text_reaction_keys_are_dropped() {
+        for bad in [
+            "",
+            "mxc://doesnmlab.xyz/AbCdEf123",
+            ":blobcat:",
+            "blobcat",
+            "hello world",
+            "привет",
+            "\u{1f44d}x",        // emoji glued to ascii
+            "a".repeat(80).as_str(),
+        ] {
+            assert!(!relayable_reaction_key(bad), "should drop {bad:?}");
+        }
+    }
 }

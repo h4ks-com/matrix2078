@@ -60,6 +60,13 @@ pub fn msgid_tag(event_id: &str) -> Tag {
     Tag("msgid".to_owned(), Some(event_id.to_owned()))
 }
 
+/// `account` tag (IRCv3 account-tag): the full Matrix user id. Clients that
+/// attribute TAGMSG reactions by account instead of the message prefix get
+/// the right author this way.
+pub fn account_tag(mxid: &str) -> Tag {
+    Tag("account".to_owned(), Some(mxid.to_owned()))
+}
+
 /// `time` (server-time) tag: ISO 8601 with millisecond precision, `Z` suffix.
 pub fn time_tag(ms: u64) -> Tag {
     Tag("time".to_owned(), Some(iso_time(ms)))
