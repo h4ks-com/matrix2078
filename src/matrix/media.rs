@@ -75,11 +75,23 @@ fn cache_file_name(uri: &matrix_sdk::ruma::MxcUri, mime_hint: Option<&str>) -> S
 /// bytes on first download, so it is not known before fetching).
 const AVATAR_EXTS: &[&str] = &["png", "jpg", "gif", "webp", "avif", "bin"];
 
+/// How long a failed avatar download suppresses retries. Federated avatar
+/// servers are frequently dead; without this every metadata SYNC would
+/// re-storm them (and the homeserver) with retries.
+const AVATAR_NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// mxcs that failed to download recently (negative cache).
+fn avatar_negative() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Fetch a user avatar into the cache and return the cached file name.
 ///
 /// Avatars are plain (unencrypted) media whose content type is not known up
 /// front: the image type is sniffed from magic bytes. Existing cache entries
-/// are returned immediately.
+/// are returned immediately; failed downloads are remembered for an hour.
 pub async fn fetch_avatar_to_cache(
     client: &Client,
     dir: &Path,
@@ -93,7 +105,16 @@ pub async fn fetch_avatar_to_cache(
             return Ok(name);
         }
     }
-    let content = client
+    let key = uri.to_string();
+    {
+        let neg = avatar_negative().lock().expect("avatar negative cache");
+        if let Some(failed_at) = neg.get(&key) {
+            if failed_at.elapsed() < AVATAR_NEGATIVE_TTL {
+                anyhow::bail!("avatar unavailable (cached failure)");
+            }
+        }
+    }
+    let content = match client
         .media()
         .get_media_content(
             &MediaRequestParameters {
@@ -103,7 +124,16 @@ pub async fn fetch_avatar_to_cache(
             false,
         )
         .await
-        .context("downloading avatar")?;
+    {
+        Ok(content) => content,
+        Err(e) => {
+            avatar_negative()
+                .lock()
+                .expect("avatar negative cache")
+                .insert(key, std::time::Instant::now());
+            return Err(anyhow::Error::new(e)).context("downloading avatar");
+        }
+    };
     let file_name = format!("{base}.{}", sniff_image_ext(&content).unwrap_or("bin"));
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let tmp = dir.join(format!(".{file_name}.part"));
