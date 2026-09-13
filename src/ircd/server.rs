@@ -1603,32 +1603,87 @@ async fn handle_metadata(
             }
         }
         "SYNC" => {
-            if resolved.starts_with('#') || bridge.lookup_avatar(&resolved).await.map(|l| matches!(l, crate::bridge::AvatarLookup::NotFound)).unwrap_or(true) {
-                let _ = tx.send(fail_metadata(server, "INVALID_TARGET", &[&resolved], "invalid metadata target")).await;
+            if resolved.starts_with('#') {
+                // channel sync: one METADATA event per member with an
+                // avatar, for the keys the client subscribed to
+                let room_id = {
+                    let maps = bridge.rooms.lock().expect("rooms mutex");
+                    maps.get_by_channel(&resolved).map(|e| e.room_id.clone())
+                };
+                let Some(room_id) = room_id else {
+                    let _ = tx.send(fail_metadata(server, "INVALID_TARGET", &[&resolved], "invalid metadata target")).await;
+                    return Ok(());
+                };
+                let Some(room) = bridge.client.get_room(&room_id) else {
+                    let _ = tx.send(fail_metadata(server, "INVALID_TARGET", &[&resolved], "invalid metadata target")).await;
+                    return Ok(());
+                };
+                let _ = tx.send(srv(server, Command::Raw("BATCH".to_owned(), vec![
+                    format!("+{ref_id}"),
+                    "metadata".to_owned(),
+                    resolved.clone(),
+                ]))).await;
+                let current = subs.lock().expect("metadata subs mutex").clone();
+                if current.iter().any(|k| k == "avatar") {
+                    // fresh member list: cached member events can lag behind
+                    // profile changes (this runs in a spawned task, the
+                    // network fetch never blocks the read loop)
+                    let members = room
+                        .members(matrix_sdk::RoomMemberships::JOIN)
+                        .await
+                        .unwrap_or_default();
+                    for m in members {
+                        let nick = crate::ircd::proto::mxid_to_nick(m.user_id().as_str());
+                        // uniform path with GET/LIST: own avatar from the
+                        // profile API, others by scanning member events of
+                        // all rooms (profile changes don't reliably refresh
+                        // the member event of *this* room)
+                        if let Ok(crate::bridge::AvatarLookup::Found(Some(url))) =
+                            bridge.lookup_avatar(&nick).await
+                        {
+                            let _ = tx.send(with_batch_tag(&ref_id, srv(server, Command::Raw("METADATA".to_owned(), vec![
+                                nick,
+                                "avatar".to_owned(),
+                                "*".to_owned(),
+                                url,
+                            ])))).await;
+                        }
+                    }
+                }
+                let _ = tx
+                    .send(srv(server, Command::Raw("BATCH".to_owned(), vec![format!("-{ref_id}")])))
+                    .await;
                 return Ok(());
             }
-            let current = subs.lock().expect("metadata subs mutex").clone();
-            let mut msgs = vec![srv(server, Command::Raw("BATCH".to_owned(), vec![
-                format!("+{ref_id}"),
-                "metadata".to_owned(),
-                resolved.clone(),
-            ]))];
-            for k in &current {
-                if k != "avatar" {
-                    continue;
+            match bridge.lookup_avatar(&resolved).await {
+                Ok(crate::bridge::AvatarLookup::NotFound) => {
+                    let _ = tx.send(fail_metadata(server, "INVALID_TARGET", &[&resolved], "invalid metadata target")).await;
                 }
-                if let Ok(crate::bridge::AvatarLookup::Found(Some(url))) = bridge.lookup_avatar(&resolved).await {
-                    msgs.push(with_batch_tag(&ref_id, srv(server, Command::Raw("METADATA".to_owned(), vec![
+                _ => {
+                    let current = subs.lock().expect("metadata subs mutex").clone();
+                    let mut msgs = vec![srv(server, Command::Raw("BATCH".to_owned(), vec![
+                        format!("+{ref_id}"),
+                        "metadata".to_owned(),
                         resolved.clone(),
-                        k.clone(),
-                        "*".to_owned(),
-                        url,
-                    ]))));
+                    ]))];
+                    for k in &current {
+                        if k != "avatar" {
+                            continue;
+                        }
+                        if let Ok(crate::bridge::AvatarLookup::Found(Some(url))) = bridge.lookup_avatar(&resolved).await {
+                            msgs.push(with_batch_tag(&ref_id, srv(server, Command::Raw("METADATA".to_owned(), vec![
+                                resolved.clone(),
+                                k.clone(),
+                                "*".to_owned(),
+                                url,
+                            ]))));
+                        }
+                    }
+                    msgs.push(srv(server, Command::Raw("BATCH".to_owned(), vec![format!("-{ref_id}")])));
+                    for m in msgs {
+                        let _ = tx.send(m).await;
+                    }
                 }
-            }
-            msgs.push(srv(server, Command::Raw("BATCH".to_owned(), vec![format!("-{ref_id}")])));
-            for m in msgs {
-                let _ = tx.send(m).await;
             }
         }
         other => {

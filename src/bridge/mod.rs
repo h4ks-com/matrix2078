@@ -263,7 +263,7 @@ impl Bridge {
 
     /// Download an avatar mxc into the media cache, returning the signed
     /// local URL.
-    async fn cache_avatar(&self, uri: &matrix_sdk::ruma::MxcUri) -> Result<String> {
+    pub async fn cache_avatar(&self, uri: &matrix_sdk::ruma::MxcUri) -> Result<String> {
         let dir = crate::matrix::media::cache_dir(&self.cfg.state_dir);
         let name = crate::matrix::media::fetch_avatar_to_cache(&self.client, &dir, uri).await?;
         Ok(self.media.url_for(&name))
