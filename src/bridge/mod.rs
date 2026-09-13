@@ -67,6 +67,9 @@ pub struct Bridge {
     /// Pending invitations awaiting `/msg &matrix accept|decline`.
     pub invites: Arc<Mutex<Vec<PendingInvite>>>,
     next_invite_idx: Arc<std::sync::atomic::AtomicU64>,
+    /// Cached avatar URL per nick (lowercased), with a freshness window:
+    /// metadata storms from bouncer reconnects must not re-scan every room.
+    avatars: Arc<Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Event ids we sent from *this* connection: their sync echo must not be
     /// relayed back (messages from the same account via other clients still
     /// must be, like matrix2051 did).
@@ -118,6 +121,7 @@ impl Bridge {
             irc_nick: nick.to_owned(),
             invites: Arc::new(Mutex::new(Vec::new())),
             next_invite_idx: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            avatars: Arc::new(Mutex::new(std::collections::HashMap::new())),
             sent: Arc::new(Mutex::new(HashSet::new())),
         }))
     }
@@ -212,16 +216,58 @@ impl Bridge {
     /// avatar image itself is fetched with authenticated media and cached on
     /// disk, so the URL is stable and never exposes a raw `mxc://` or
     /// homeserver endpoint to the IRC client.
+    /// How long a resolved avatar URL stays fresh.
+    const AVATAR_URL_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// Local signed URL of `target_nick`'s Matrix avatar.
+    ///
+    /// Results are memoized per nick for [`Self::AVATAR_URL_TTL`]: bouncers
+    /// that re-query metadata on every reconnect of their downstream clients
+    /// must not trigger room scans and avatar fetches in a loop.
     pub async fn lookup_avatar(&self, target_nick: &str) -> Result<AvatarLookup> {
-        let started = std::time::Instant::now();
+        let cache_key = target_nick.to_ascii_lowercase();
+        {
+            let cache = self.avatars.lock().expect("avatars mutex");
+            if let Some((url, at)) = cache.get(&cache_key) {
+                if at.elapsed() < Self::AVATAR_URL_TTL {
+                    return Ok(AvatarLookup::Found(Some(url.clone())));
+                }
+            }
+        }
         let result = self.lookup_avatar_inner(target_nick).await;
+        if let Ok(AvatarLookup::Found(Some(url))) = &result {
+            self.avatars
+                .lock()
+                .expect("avatars mutex")
+                .insert(cache_key, (url.clone(), std::time::Instant::now()));
+        }
         tracing::debug!(
             target = target_nick,
-            elapsed_ms = started.elapsed().as_millis() as u64,
             found = matches!(result, Ok(AvatarLookup::Found(Some(_)))),
             "avatar lookup done"
         );
         result
+    }
+
+    /// Avatar URL from the cache, or fetch the given mxc into the media
+    /// cache and memoize — used by channel SYNC where member events are
+    /// already in hand and no room scan is needed.
+    pub async fn cached_avatar_for(&self, nick: &str, uri: &matrix_sdk::ruma::MxcUri) -> Result<String> {
+        let cache_key = nick.to_ascii_lowercase();
+        {
+            let cache = self.avatars.lock().expect("avatars mutex");
+            if let Some((url, at)) = cache.get(&cache_key) {
+                if at.elapsed() < Self::AVATAR_URL_TTL {
+                    return Ok(url.clone());
+                }
+            }
+        }
+        let url = self.cache_avatar(uri).await?;
+        self.avatars
+            .lock()
+            .expect("avatars mutex")
+            .insert(cache_key, (url.clone(), std::time::Instant::now()));
+        Ok(url)
     }
 
     async fn lookup_avatar_inner(&self, target_nick: &str) -> Result<AvatarLookup> {

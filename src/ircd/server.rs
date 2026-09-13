@@ -298,7 +298,9 @@ fn spawn_writer<S: ClientStream + 'static>(
                                 break;
                             }
                         }
-                        None => continue,
+                        // all prio senders are gone: exit instead of
+                        // spinning on a closed channel
+                        None => break,
                     }
                 }
                 _ = keepalive.tick() => {
@@ -740,6 +742,9 @@ async fn relay_loop<S: ClientStream>(
     // per-connection draft/metadata-2 key subscriptions
     let metadata_subs: Arc<std::sync::Mutex<Vec<String>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
+    // per-target SYNC rate limiting (RPL_METADATASYNCLATER)
+    let metadata_last_sync: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
     let tx = tx.clone();
     let prio_tx = prio_tx.clone();
     loop {
@@ -1153,12 +1158,12 @@ async fn relay_loop<S: ClientStream>(
                                 }
                             }
                         }
-                        run_metadata(bridge, &tx, server, nick, &metadata_subs, &batch_counter, args);
+                        run_metadata(bridge, &tx, server, nick, &metadata_subs, &metadata_last_sync, &batch_counter, args);
                     }
                     Command::Raw(cmd, args) if cmd.eq_ignore_ascii_case("METADATA") => {
                         // avatar lookups hit the matrix state store (and the
                         // network on cache misses): keep the read loop free
-                        run_metadata(bridge, &tx, server, nick, &metadata_subs, &batch_counter, args);
+                        run_metadata(bridge, &tx, server, nick, &metadata_subs, &metadata_last_sync, &batch_counter, args);
                     }
                     Command::Response(..) | Command::Raw(..) => {}
                     other => {
@@ -1399,6 +1404,7 @@ fn run_metadata(
     server: &str,
     nick: &str,
     subs: &Arc<std::sync::Mutex<Vec<String>>>,
+    last_sync: &Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     counter: &AtomicU64,
     args: Vec<String>,
 ) {
@@ -1407,9 +1413,10 @@ fn run_metadata(
     let server2 = server.to_owned();
     let nick2 = nick.to_owned();
     let subs2 = Arc::clone(subs);
+    let last_sync2 = Arc::clone(last_sync);
     let ref_id = format!("md{}", counter.fetch_add(1, Ordering::Relaxed));
     tokio::spawn(async move {
-        if let Err(e) = handle_metadata(tx, &server2, &nick2, &bridge2, &subs2, ref_id, args).await {
+        if let Err(e) = handle_metadata(tx, &server2, &nick2, &bridge2, &subs2, &last_sync2, ref_id, args).await {
             tracing::warn!(error = %e, "metadata failed");
         }
     });
@@ -1422,6 +1429,7 @@ async fn handle_metadata(
     nick: &str,
     bridge: &Arc<Bridge>,
     subs: &Arc<std::sync::Mutex<Vec<String>>>,
+    last_sync: &Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     ref_id: String,
     args: Vec<String>,
 ) -> Result<()> {
@@ -1603,6 +1611,25 @@ async fn handle_metadata(
             }
         }
         "SYNC" => {
+            // rate limit: bouncers that re-SYNC on every reconnect of their
+            // own downstream clients must not trigger per-member room scans
+            // and federated avatar fetches in a loop (this cooked the CPU).
+            // draft/metadata-2's answer is RPL_METADATASYNCLATER.
+            const SYNC_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+            let too_soon = {
+                let mut lm = last_sync.lock().expect("metadata sync mutex");
+                match lm.get(&resolved) {
+                    Some(at) if at.elapsed() < SYNC_MIN_INTERVAL => true,
+                    _ => {
+                        lm.insert(resolved.clone(), std::time::Instant::now());
+                        false
+                    }
+                }
+            };
+            if too_soon {
+                let _ = tx.send(md_num(server, "774", nick, vec![resolved.clone(), "10".to_owned()])).await;
+                return Ok(());
+            }
             if resolved.starts_with('#') {
                 // channel sync: one METADATA event per member with an
                 // avatar, for the keys the client subscribed to
@@ -1625,22 +1652,30 @@ async fn handle_metadata(
                 ]))).await;
                 let current = subs.lock().expect("metadata subs mutex").clone();
                 if current.iter().any(|k| k == "avatar") {
-                    // fresh member list: cached member events can lag behind
-                    // profile changes (this runs in a spawned task, the
-                    // network fetch never blocks the read loop)
+                    // local store only: the JOIN burst / NAMES already
+                    // refreshed the member events of this room; scanning
+                    // every mapped room per member (lookup_avatar) made
+                    // SYNC O(members × rooms) and burned the CPU
                     let members = room
-                        .members(matrix_sdk::RoomMemberships::JOIN)
+                        .members_no_sync(matrix_sdk::RoomMemberships::JOIN)
                         .await
                         .unwrap_or_default();
-                    for m in members {
+                    for m in &members {
                         let nick = crate::ircd::proto::mxid_to_nick(m.user_id().as_str());
-                        // uniform path with GET/LIST: own avatar from the
-                        // profile API, others by scanning member events of
-                        // all rooms (profile changes don't reliably refresh
-                        // the member event of *this* room)
-                        if let Ok(crate::bridge::AvatarLookup::Found(Some(url))) =
-                            bridge.lookup_avatar(&nick).await
-                        {
+                        let url = if m.user_id() == bridge.own_mxid {
+                            // own avatar via the profile API (memoized):
+                            // the local member event may not know it yet
+                            match bridge.lookup_avatar(&nick).await {
+                                Ok(crate::bridge::AvatarLookup::Found(u)) => u,
+                                _ => None,
+                            }
+                        } else {
+                            match m.avatar_url() {
+                                Some(uri) => bridge.cached_avatar_for(&nick, uri).await.ok(),
+                                None => None,
+                            }
+                        };
+                        if let Some(url) = url {
                             let _ = tx.send(with_batch_tag(&ref_id, srv(server, Command::Raw("METADATA".to_owned(), vec![
                                 nick,
                                 "avatar".to_owned(),
